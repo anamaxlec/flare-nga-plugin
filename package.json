@@ -1,12 +1,13 @@
 {
   "name": "dev.maxlec.nga",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "scripts": {
     "check": "tsc --noEmit",
     "build": "npm run check && node build.mjs",
     "dev": "node build.mjs --watch",
-    "package": "npm run check && node build.mjs --package"
+    "package": "npm run check && node build.mjs --package",
+    "test": "node --test"
   },
   "devDependencies": {
     "esbuild": "0.28.2",

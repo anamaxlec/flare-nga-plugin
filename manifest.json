@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "apiVersion": 1,
   "id": "dev.maxlec.nga",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "defaultLocale": "zh-Hans",
   "name": "NGA",
   "description": "NGA 玩家社区版面、帖子和回复",
@@ -57,7 +57,12 @@
       },
       "flare.datasource.tab-catalog/v1": {
         "operations": {
-          "page": {}
+          "page": {
+            "directions": [
+              "refresh",
+              "older"
+            ]
+          }
         }
       },
       "flare.datasource.post/v1": {
@@ -114,6 +119,60 @@
         "display": "List",
         "parameters": {
           "fid": "-7"
+        }
+      },
+      {
+        "id": "forum-321",
+        "title": "DOTA2",
+        "icon": "Channel",
+        "display": "List",
+        "parameters": {
+          "fid": "321"
+        }
+      },
+      {
+        "id": "forum-321-sub-521",
+        "title": "DOTA2 · DOTA2杂谈",
+        "icon": "Channel",
+        "display": "List",
+        "parameters": {
+          "fid": "521"
+        }
+      },
+      {
+        "id": "forum-321-sub-574",
+        "title": "DOTA2 · 精华区",
+        "icon": "Channel",
+        "display": "List",
+        "parameters": {
+          "fid": "574"
+        }
+      },
+      {
+        "id": "forum-7-sub-533",
+        "title": "魔兽世界 · 大秘境集合石",
+        "icon": "Channel",
+        "display": "List",
+        "parameters": {
+          "fid": "533"
+        }
+      },
+      {
+        "id": "forum-650-sub-754",
+        "title": "原神 · 旅行者指引广场",
+        "icon": "Channel",
+        "display": "List",
+        "parameters": {
+          "fid": "754"
+        }
+      },
+      {
+        "id": "forum-650-sub-793",
+        "title": "原神 · 冒险家协会",
+        "icon": "Channel",
+        "display": "List",
+        "parameters": {
+          "fid": "793"
         }
       }
     ],

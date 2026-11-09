@@ -9,6 +9,8 @@ const CAPS = {
   "flare.datasource.profile/v1": ["byId", "byHandle"],
 };
 const LANGUAGE = ["zh-CN"];
+const AVATAR_PLACEHOLDER = "https://img4.nga.cn/ngabbs/face/a_sheep.png";
+const SUBBOARD_BATCH_SIZE = 4;
 const BOARDS = [
   { name: "游戏讨论", forums: [
     ["7", "艾泽拉斯议事厅"], ["310", "精英议会"], ["510569", "魔兽世界：无限"],
@@ -21,6 +23,10 @@ const BOARDS = [
     ["334", "硬件配置"], ["436", "消费电子 IT新闻"], ["-576177", "音乐影视"],
   ] },
 ] as const;
+const SUBBOARD_PARENTS = [...new Set(["7", "321", "650", "-447601",
+  ...BOARDS.flatMap(({ forums }) => forums.map(([fid]) => fid)),
+])];
+
 type Row = Record<string, unknown>;
 type Cookie = { name: string; value: string };
 
@@ -52,41 +58,58 @@ defineFlareSocialPlugin({
   capabilities: {
     timeline: {
       async page(request, context) {
-        const fid = forumId(request.parameters.fid ?? request.page.parameters.fid);
+        const fid = forumId(request.parameters?.fid ?? request.page.parameters?.fid);
         if (fid === undefined) fail("Validation", "没有指定 NGA 版面");
         const position = cursor(request.page);
-        const data = await api("/thread.php?fid=" + fid + "&page=" + position.batch, context);
+        const cookies = await cookiesFor(context);
+        const data = await api("/thread.php?fid=" + fid + "&page=" + position.batch, context, cookies);
+        const users = obj(data.__U);
         const forum = obj(data.__F);
         const name = str(forum?.name) || BOARDS.flatMap(({ forums }) => [...forums]).find(([id]) => id === fid)?.[1];
         const topics = rows(data.__T);
         const items: TimelineItemV1[] = topics.flatMap((thread) => {
           const tid = numeric(thread.tid);
           if (!tid || (position.batch > 1 && (Number(thread.type) & 5120) !== 0)) return [];
-          return [{ type: "post", post: preview(thread, tid, str(name)) }];
+          return [{ type: "post", post: preview(thread, tid, str(name), obj(users?.[str(thread.authorid)])) }];
         });
         const total = number(data.__ROWS);
         const batchSize = number(data.__T__ROWS_PAGE) ?? 35;
-        return slice(items, request.page, position, topics.length > 0 && total !== undefined && position.batch * batchSize < total);
+        const result = slice(items, request.page, position, topics.length > 0 && total !== undefined && position.batch * batchSize < total);
+        if (cookies.length) await loadListAvatars(result.items ?? [], cookies);
+        return result;
       },
     },
     tabCatalog: {
-      async page(_request, context) {
-        const sections: TimelineSectionV1[] = BOARDS.map(({ name, forums }, index) => ({
+      async page(request, context) {
+        const offset = request.direction === "refresh" ? 0 : number(/^subboards:(\d+)$/.exec(request.cursor ?? "")?.[1]);
+        if (offset === undefined || request.direction === "newer") return { items: [], endReached: true };
+        const sections: TimelineSectionV1[] = offset === 0 ? BOARDS.map(({ name, forums }, index) => ({
           id: "group-" + index, title: { value: name },
           timelines: { items: forums.map(([fid, name]) => board(fid, name)), endReached: true },
+        })) : [];
+        const parents = SUBBOARD_PARENTS.slice(offset, offset + SUBBOARD_BATCH_SIZE);
+        const cookies = await cookiesFor(context);
+        const children = await Promise.all(parents.map(async (fid) => {
+          const data = await api("/thread.php?fid=" + fid + "&page=1", context, cookies).catch(() => undefined);
+          const forum = obj(data?.__F);
+          const name = str(forum?.name) || BOARDS.flatMap(({ forums }) => [...forums]).find(([id]) => id === fid)?.[1];
+          if (!name) return undefined;
+          const items = Object.entries(obj(forum?.sub_forums) ?? {}).flatMap(([entry, value]) => {
+            const row = list(value);
+            const childId = forumId(entry);
+            const childName = str(row[1]).trim();
+            // t-prefixed entries link to single threads, not child forums.
+            return childId && childId !== fid && childName ? [board(childId, name + " · " + childName, fid)] : [];
+          });
+          return items.length ? {
+            id: "sub-" + fid, title: { value: name },
+            timelines: { items, endReached: true },
+          } : undefined;
         }));
-        // NGA exposes the live sub-forum directory alongside the parent board.
-        const data = await api("/thread.php?fid=7&page=1", context).catch(() => undefined);
-        const forum = obj(data?.__F);
-        const known = new Set<string>(BOARDS.flatMap(({ forums }) => forums.map(([fid]) => fid)));
-        const children = Object.entries(obj(forum?.sub_forums) ?? {}).flatMap(([entry, value]) => {
-          const row = Array.isArray(value) ? value : [];
-          const fid = forumId(entry);
-          const name = str(row[1]);
-          return fid && name && !known.has(fid) ? [board(fid, name)] : [];
-        });
-        if (children.length) sections.push({ id: "wow-sub", title: { value: "魔兽世界子版" }, timelines: { items: children, endReached: true } });
-        return { items: sections, endReached: true };
+        for (const section of children) if (section) sections.push(section);
+        const next = offset + parents.length;
+        const endReached = next >= SUBBOARD_PARENTS.length;
+        return { items: sections, olderCursor: endReached ? undefined : "subboards:" + next, endReached };
       },
     },
     profile: {
@@ -127,14 +150,16 @@ defineFlareSocialPlugin({
   },
 });
 
-function board(fid: string, name: string): TimelineDescriptorV1 {
-  return { id: "forum-" + fid, title: { value: name }, icon: "Channel", parameters: { fid } };
+function board(fid: string, name: string, parent?: string): TimelineDescriptorV1 {
+  const id = parent ? "forum-" + parent + "-sub-" + fid : "forum-" + fid;
+  return { id, title: { value: name }, icon: "Channel", parameters: { fid } };
 }
 
-async function get(path: string, cookies: Cookie[], output = 11) {
+async function get(path: string, cookies: Cookie[], output = 11, timeoutMillis?: number) {
   const response = await flare.http.request({
     url: ORIGIN + path + "&__output=" + output,
     cookies,
+    timeoutMillis,
     headers: {
       Accept: "application/json",
       Referer: ORIGIN + "/",
@@ -146,9 +171,8 @@ async function get(path: string, cookies: Cookie[], output = 11) {
   return { status: response.status, root };
 }
 
-async function api(path: string, context: PluginInvocationContextV1): Promise<Row> {
-  const cookies = await cookiesFor(context);
-  let result = await get(path, cookies);
+async function api(path: string, context: PluginInvocationContextV1, cookies?: Cookie[]): Promise<Row> {
+  let result = await get(path, cookies ?? await cookiesFor(context));
   if (context.scope === "guest" && str(list(result.root?.error)[0]).startsWith("15:")) {
     // Use the same anonymous session token NGA's browser page offers when entering as a guest.
     const script = str(list(result.root?.error)[1]);
@@ -156,14 +180,16 @@ async function api(path: string, context: PluginInvocationContextV1): Promise<Ro
     if (guest) result = await get(path + "&rand=" + Date.now(), [{ name: "guestJs", value: guest }]);
   }
   const { status, root } = result;
-  const message = str(list(root?.error)[0]) || str(root?.msg);
+  const data = obj(root?.data);
+  const details = data?.__MESSAGE;
+  const message = str(list(root?.error)[0]) || str(root?.msg) ||
+    str(list(details)[1] ?? obj(details)?.["1"]);
   if (status === 401 || status === 403 || /未登录|先登录|访客|权限/.test(message)) {
     fail("AuthenticationRequired", message || "请登录 NGA 或检查版面权限");
   }
   if (status === 404 || /帖子不存在|主题不存在|找不到/.test(message)) fail("NotFound", message || "NGA 页面不存在");
   if (status === 429) fail("RateLimited", "NGA 请求过于频繁");
   if (status >= 400 || message) fail("Remote", message || "NGA 暂时无法返回数据");
-  const data = obj(root?.data);
   if (!data) fail("InvalidResponse", "NGA 没有返回可读取的数据");
   return data;
 }
@@ -178,9 +204,30 @@ async function cookiesFor(context: PluginInvocationContextV1): Promise<Cookie[]>
   });
 }
 
-async function accountProfile(uid: string, cookies: Cookie[]): Promise<Row | undefined> {
-  const { root } = await get("/nuke.php?__lib=ucp&__act=get&uid=" + uid, cookies, 14);
+async function accountProfile(uid: string, cookies: Cookie[], timeoutMillis?: number): Promise<Row | undefined> {
+  const { root } = await get("/nuke.php?__lib=ucp&__act=get&uid=" + uid, cookies, 14, timeoutMillis);
   return rows(root?.result).find((profile) => numeric(profile.uid) === uid);
+}
+
+async function loadListAvatars(items: TimelineItemV1[], cookies: Cookie[]) {
+  const authors = new Map<string, ProfileV1[]>();
+  for (const item of items) {
+    if (item.type !== "post" || item.post.author?.avatarUrl !== AVATAR_PLACEHOLDER) continue;
+    const author = item.post.author;
+    const id = author.key.id;
+    const group = authors.get(id) ?? [];
+    group.push(author);
+    authors.set(id, group);
+  }
+  // The UCP endpoint accepts one UID per call. Bound the additional work to the visible page.
+  const pending = [...authors].slice(0, 20);
+  for (let offset = 0; offset < pending.length; offset += 5) {
+    await Promise.all(pending.slice(offset, offset + 5).map(async ([uid, profiles]) => {
+      const user = await accountProfile(uid, cookies, 2_000).catch(() => undefined);
+      const url = avatarUrl(str(user?.avatar));
+      if (url) for (const profile of profiles) profile.avatarUrl = url;
+    }));
+  }
 }
 
 function publicProfile(row: Row | undefined): ProfileV1 {
@@ -218,10 +265,10 @@ function postRef(id: string) {
   return { tid: reply[1], pid: reply[2], batch: Number(reply[3]) };
 }
 
-function preview(thread: Row, tid: string, forum: string): PostV1 {
+function preview(thread: Row, tid: string, forum: string, profile?: Row): PostV1 {
   const title = str(thread.subject);
   return {
-    key: key(tid), author: user(numeric(thread.authorid), thread.author),
+    key: key(tid), author: user(numeric(thread.authorid), thread.author, profile),
     createdAt: time(thread.postdate),
     content: { format: "html", value: "<b>" + escape(title) + "</b>" },
     repliesCount: number(thread.replies),
@@ -270,10 +317,35 @@ function user(uid: string | undefined, value: unknown, profile?: Row): ProfileV1
   const name = str(value).trim() || "UID " + uid;
   return {
     key: key(uid), handle: uid, displayName: name,
-    avatarUrl: https(str(profile?.avatar).split("|")[0]),
+    avatarUrl: avatarUrl(str(profile?.avatar)) ?? AVATAR_PLACEHOLDER,
     followersCount: number(profile?.follow_by_num),
     url: ORIGIN + "/nuke.php?__lib=ucp&__act=get&uid=" + uid,
   };
+}
+
+function avatarUrl(value: string): string | undefined {
+  let candidates: unknown[];
+  if (value.startsWith("/*$js$*/")) {
+    try { candidates = Object.values(obj(JSON.parse(value.slice(8))) ?? {}); }
+    catch { return undefined; }
+  } else {
+    candidates = value.replace(/%7c/gi, "|").split("|");
+  }
+  for (const candidate of candidates) {
+    const entry = (Array.isArray(candidate) ? str(candidate[0]) : str(candidate)).trim();
+    const remote = https(entry);
+    if (remote) return remote;
+    const short = /^\.a\/(\d+)_(\d+\.(?:jpe?g|png|gif|webp(?:\.jpg)?)(?:\?\d+)?)$/i.exec(entry);
+    if (short) {
+      const shard = Number(short[1]).toString(16).padStart(9, "0").slice(-9);
+      return "https://img.nga.cn/avatars/2002/" + shard.slice(6) + "/" +
+        shard.slice(3, 6) + "/" + shard.slice(0, 3) + "/" + short[1] + "_" + short[2];
+    }
+    if (/^[a-z\d_%-]+\.(?:jpe?g|png|gif|webp)$/i.test(entry)) {
+      return "https://img4.nga.cn/ngabbs/face/" + entry;
+    }
+  }
+  return undefined;
 }
 
 function cursor(page: PageRequestV1) {
