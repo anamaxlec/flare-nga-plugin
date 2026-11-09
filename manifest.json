@@ -1,0 +1,124 @@
+{
+  "$schema": "https://unpkg.com/flare-plugin-sdk@0.1.0-beta.10/skill/flare-plugin/manifest.schema.json",
+  "schemaVersion": 1,
+  "apiVersion": 1,
+  "id": "dev.maxlec.nga",
+  "version": "0.1.0",
+  "defaultLocale": "zh-Hans",
+  "name": "NGA",
+  "description": "NGA 玩家社区版面、帖子和回复",
+  "permissions": {
+    "mediaNetwork": true
+  },
+  "platform": {
+    "id": "nga",
+    "name": "NGA",
+    "detector": {
+      "priority": 0
+    },
+    "loginMethods": [
+      {
+        "id": "browser",
+        "interaction": "WebCookie",
+        "title": {
+          "key": "login.browser",
+          "fallback": "Sign in with browser"
+        },
+        "cookie": {
+          "startUrl": "$accountOrigin/nuke.php?__lib=login&__act=account&login",
+          "probes": [
+            {
+              "url": "$accountOrigin/nuke.php?__lib=noti&__act=if&__output=11",
+              "cookies": [
+                {
+                  "name": "ngaPassportUid",
+                  "required": true
+                },
+                {
+                  "name": "ngaPassportCid",
+                  "required": true
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ],
+    "capabilities": {
+      "flare.datasource.timeline/v1": {
+        "operations": {
+          "page": {
+            "directions": [
+              "refresh",
+              "older"
+            ]
+          }
+        }
+      },
+      "flare.datasource.tab-catalog/v1": {
+        "operations": {
+          "page": {}
+        }
+      },
+      "flare.datasource.post/v1": {
+        "operations": {
+          "detail": {},
+          "context": {
+            "directions": [
+              "refresh",
+              "older"
+            ]
+          }
+        }
+      },
+      "flare.datasource.profile/v1": {
+        "operations": {
+          "byId": {},
+          "byHandle": {}
+        }
+      }
+    },
+    "timelines": [
+      {
+        "id": "latest",
+        "title": "最新主题",
+        "icon": "Home",
+        "display": "List",
+        "parameters": {
+          "fid": "0"
+        },
+        "defaultForNewAccount": true
+      },
+      {
+        "id": "wow",
+        "title": "魔兽世界",
+        "icon": "List",
+        "display": "List",
+        "parameters": {
+          "fid": "7"
+        }
+      },
+      {
+        "id": "blizzard",
+        "title": "精英议会",
+        "icon": "List",
+        "display": "List",
+        "parameters": {
+          "fid": "310"
+        }
+      },
+      {
+        "id": "chat",
+        "title": "网事杂谈",
+        "icon": "List",
+        "display": "List",
+        "parameters": {
+          "fid": "-7"
+        }
+      }
+    ],
+    "guest": {
+      "enabled": true
+    }
+  }
+}

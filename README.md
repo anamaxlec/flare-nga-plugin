@@ -1,0 +1,17 @@
+# NGA Flare 插件
+
+NGA 玩家社区的 Flare Social Plugin API v1 适配器。游客可读公开版面，受限内容需要登录并具备站点要求的权限。
+
+- 内置最新主题、魔兽世界、精英议会和网事杂谈时间线。可在目录添加其他常用版面，艾泽拉斯议事厅的子版从站点读取。
+- 帖子详情包含主楼和翻页回复，支持查看用户资料、显示图片、GIF、引用和链接。
+- 添加账号时输入 `bbs.nga.cn`。插件在 Flare 内置浏览器打开 NGA 登录页，用会话 Cookie 校验账号。
+- 站内搜索、发帖、回帖、收藏同步和通知未接入。
+
+`plugin.fpp` 是本地安装包。支持导入插件包的 Flare 客户端可在插件管理中选择它。开发时也可加载这个目录。
+
+```sh
+npm ci
+npm run package
+```
+
+首次发布时在 GitHub 仓库根目录提交 `manifest.json`、`plugin.js`、`assets/`、`locales/` 和构建源码。版本标签与 manifest 一致。
