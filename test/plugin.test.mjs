@@ -77,19 +77,37 @@ test("thread detail loads a missing signed-in author's avatar and renders the or
   const thread = await post.context({ key, page }, guest);
   assert.equal(thread.items[0].post.key.id, "2");
   assert.match(thread.items[0].post.content.value, /Original body/);
+  assert.equal(thread.items[1].post.replyTo, undefined);
   assert.equal(thread.items[1].post.author.avatarUrl, "https://img4.nga.cn/ngabbs/face/a_arcane.webp");
 });
 
-test("catalog exposes independent DOTA2 subforums and does not mistake topic shortcuts for forums", async () => {
-  const { tabCatalog, requests } = register((url) => ({ data: { __F: url.searchParams.get("fid") === "321"
-    ? { name: "DOTA2", sub_forums: { 521: [521, "DOTA2杂谈"], 574: [574, "精华区"], t40146107: [40146107, "档案馆"] } }
-    : {} } }));
+test("catalog includes official boards and their independent subforums while skipping topic shortcuts", async () => {
+  const { tabCatalog, requests } = register((url) => {
+    if (url.searchParams.get("__act") === "get_all_forums") return { data: [{ all: {
+      club: { name: "社区事务", content: [{ name: "合集", content: [
+        { fid: 781, name: "合集事务" }, { fid: "510343", name: "赛车俱乐部" }, { fid: 830, name: "极限竞速" },
+        { fid: 781, name: "帖子捷径", stid: 123 }, { fid: "-5944654", name: "ASOUL综合讨论" },
+      ] }] },
+    } }] };
+    const fid = url.searchParams.get("fid");
+    const forums = {
+      321: { name: "DOTA2", sub_forums: { 521: [521, "DOTA2杂谈"], 574: [574, "精华区"], t40146107: [40146107, "档案馆"] } },
+      510343: { name: "赛车俱乐部", sub_forums: { 830: [830, "极限竞速:地平线系列"], t33237742: [33237742, "F1 车队经理"] } },
+    };
+    return { data: { __F: forums[fid] ?? {} } };
+  });
   const first = await tabCatalog.page(page, account);
   const dota = first.items.find(({ id }) => id === "sub-321");
   assert.equal(dota.timelines.items.length, 2);
   assert.equal(dota.timelines.items[0].title.value, "DOTA2 · DOTA2杂谈");
   assert.equal(dota.timelines.items[0].parameters.fid, "521");
   assert.equal(dota.timelines.items[1].parameters.fid, "574");
+  const boards = first.items.flatMap(({ timelines }) => timelines.items);
+  assert.equal(boards.find(({ parameters }) => parameters.fid === "510343").title.value, "赛车俱乐部");
+  assert.equal(boards.filter(({ parameters }) => parameters.fid === "830").length, 1);
+  assert.ok(boards.some(({ parameters }) => parameters.fid === "-5944654"));
+  assert.ok(!boards.some(({ title }) => title.value === "帖子捷径" || title.value.includes("F1 车队经理")));
+  assert.equal(requests.find(({ url }) => url.searchParams.get("__act") === "get_all_forums").cookies.length, 0);
   assert.equal(first.olderCursor, "subboards:4");
   await tabCatalog.page({ direction: "older", limit: 20, cursor: first.olderCursor }, account);
   assert.ok(requests.some(({ url }) => url.searchParams.get("fid") === "310"));

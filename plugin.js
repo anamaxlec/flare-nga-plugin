@@ -13,6 +13,7 @@
   };
   var LANGUAGE = ["zh-CN"];
   var AVATAR_PLACEHOLDER = "https://img4.nga.cn/ngabbs/face/a_sheep.png";
+  var FORUM_INDEX = "/nuke.php?__lib=nga_index&__act=get_all_forums";
   var SUBBOARD_BATCH_SIZE = 4;
   var BOARDS = [
     { name: "\u6E38\u620F\u8BA8\u8BBA", forums: [
@@ -34,13 +35,14 @@
       ["334", "\u786C\u4EF6\u914D\u7F6E"],
       ["436", "\u6D88\u8D39\u7535\u5B50 IT\u65B0\u95FB"],
       ["-576177", "\u97F3\u4E50\u5F71\u89C6"]
-    ] }
+    ] },
+    { name: "\u793E\u533A\u4E8B\u52A1 \xB7 \u5408\u96C6", forums: [["510343", "\u8D5B\u8F66\u4FF1\u4E50\u90E8"]] }
   ];
   var SUBBOARD_PARENTS = [.../* @__PURE__ */ new Set([
     "7",
     "321",
     "650",
-    "-447601",
+    "510343",
     ...BOARDS.flatMap(({ forums }) => forums.map(([fid]) => fid))
   ])];
   defineFlareSocialPlugin({
@@ -93,13 +95,14 @@
         async page(request, context) {
           const offset = request.direction === "refresh" ? 0 : number(/^subboards:(\d+)$/.exec(request.cursor ?? "")?.[1]);
           if (offset === void 0 || request.direction === "newer") return { items: [], endReached: true };
-          const sections = offset === 0 ? BOARDS.map(({ name, forums }, index) => ({
-            id: "group-" + index,
+          const sections = offset === 0 ? BOARDS.map(({ name, forums }, index2) => ({
+            id: "group-" + index2,
             title: { value: name },
             timelines: { items: forums.map(([fid, name2]) => board(fid, name2)), endReached: true }
           })) : [];
           const parents = SUBBOARD_PARENTS.slice(offset, offset + SUBBOARD_BATCH_SIZE);
           const cookies = await cookiesFor(context);
+          const index = offset === 0 ? get(FORUM_INDEX, [], 11, 4e3).catch(() => void 0) : void 0;
           const children = await Promise.all(parents.map(async (fid) => {
             const data = await api("/thread.php?fid=" + fid + "&page=1", context, cookies).catch(() => void 0);
             const forum = obj(data?.__F);
@@ -108,7 +111,7 @@
             const items = Object.entries(obj(forum?.sub_forums) ?? {}).flatMap(([entry, value]) => {
               const row = list(value);
               const childId = forumId(entry);
-              const childName = str(row[1]).trim();
+              const childName = decodeLabel(row[1]);
               return childId && childId !== fid && childName ? [board(childId, name + " \xB7 " + childName, fid)] : [];
             });
             return items.length ? {
@@ -118,6 +121,10 @@
             } : void 0;
           }));
           for (const section of children) if (section) sections.push(section);
+          if (index) {
+            const response = await index;
+            if (response?.status === 200) sections.push(...publicBoardSections(response.root?.data, sections));
+          }
           const next = offset + parents.length;
           const endReached = next >= SUBBOARD_PARENTS.length;
           return { items: sections, olderCursor: endReached ? void 0 : "subboards:" + next, endReached };
@@ -165,6 +172,34 @@
   function board(fid, name, parent) {
     const id = parent ? "forum-" + parent + "-sub-" + fid : "forum-" + fid;
     return { id, title: { value: name }, icon: "Channel", parameters: { fid } };
+  }
+  function publicBoardSections(data, featured) {
+    const groups = obj(rows(data)[0]?.all);
+    const seen = new Set(featured.flatMap((section) => (section.timelines.items ?? []).flatMap((timeline) => timeline.parameters?.fid ?? [])));
+    const sections = [];
+    for (const group of rows(groups)) {
+      const name = decodeLabel(group.name);
+      if (!name) continue;
+      const items = collectPublicBoards(group, seen);
+      for (let start = 0; start < items.length; start += 200) {
+        sections.push({
+          id: "index-" + sections.length,
+          title: { value: name },
+          timelines: { items: items.slice(start, start + 200), endReached: true }
+        });
+      }
+    }
+    return sections;
+  }
+  function collectPublicBoards(group, seen) {
+    return rows(group.content).flatMap((entry) => {
+      const fid = forumId(entry.fid);
+      const name = decodeLabel(entry.name);
+      if (!fid) return collectPublicBoards(entry, seen);
+      if (!name || numeric(entry.stid) || seen.has(fid)) return [];
+      seen.add(fid);
+      return [board(fid, name)];
+    });
   }
   async function get(path, cookies, output = 11, timeoutMillis) {
     const response = await flare.http.request({
@@ -312,8 +347,9 @@
       author: user(uid, name, author),
       createdAt: time(row.postdatetimestamp),
       content: { format: "html", value: (title ? "<b>" + escape(title) + "</b><br><br>" : "") + (body || " ") },
+      // The thread already shows the main post as its own row. Reply references
+      // make Flare inline that same post above every floor in the first page.
       media,
-      replyTo: root ? void 0 : key(data.tid),
       repliesCount: root ? number(data.thread.replies) : void 0,
       url: ORIGIN + "/read.php?tid=" + data.tid + (root ? "" : "&pid=" + str(row.pid)),
       sourceChannel: root && str(data.forum?.name) ? { id: str(data.thread.fid), name: str(data.forum?.name) } : void 0,

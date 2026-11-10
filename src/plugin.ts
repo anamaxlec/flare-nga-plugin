@@ -10,6 +10,7 @@ const CAPS = {
 };
 const LANGUAGE = ["zh-CN"];
 const AVATAR_PLACEHOLDER = "https://img4.nga.cn/ngabbs/face/a_sheep.png";
+const FORUM_INDEX = "/nuke.php?__lib=nga_index&__act=get_all_forums";
 const SUBBOARD_BATCH_SIZE = 4;
 const BOARDS = [
   { name: "游戏讨论", forums: [
@@ -22,8 +23,9 @@ const BOARDS = [
     ["-7", "网事杂谈"], ["-447601", "二次元国家地理"],
     ["334", "硬件配置"], ["436", "消费电子 IT新闻"], ["-576177", "音乐影视"],
   ] },
+  { name: "社区事务 · 合集", forums: [["510343", "赛车俱乐部"]] },
 ] as const;
-const SUBBOARD_PARENTS = [...new Set(["7", "321", "650", "-447601",
+const SUBBOARD_PARENTS = [...new Set(["7", "321", "650", "510343",
   ...BOARDS.flatMap(({ forums }) => forums.map(([fid]) => fid)),
 ])];
 
@@ -85,6 +87,7 @@ defineFlareSocialPlugin({
         })) : [];
         const parents = SUBBOARD_PARENTS.slice(offset, offset + SUBBOARD_BATCH_SIZE);
         const cookies = await cookiesFor(context);
+        const index = offset === 0 ? get(FORUM_INDEX, [], 11, 4_000).catch(() => undefined) : undefined;
         const children = await Promise.all(parents.map(async (fid) => {
           const data = await api("/thread.php?fid=" + fid + "&page=1", context, cookies).catch(() => undefined);
           const forum = obj(data?.__F);
@@ -93,7 +96,7 @@ defineFlareSocialPlugin({
           const items = Object.entries(obj(forum?.sub_forums) ?? {}).flatMap(([entry, value]) => {
             const row = list(value);
             const childId = forumId(entry);
-            const childName = str(row[1]).trim();
+            const childName = decodeLabel(row[1]);
             // t-prefixed entries link to single threads, not child forums.
             return childId && childId !== fid && childName ? [board(childId, name + " · " + childName, fid)] : [];
           });
@@ -103,6 +106,10 @@ defineFlareSocialPlugin({
           } : undefined;
         }));
         for (const section of children) if (section) sections.push(section);
+        if (index) {
+          const response = await index;
+          if (response?.status === 200) sections.push(...publicBoardSections(response.root?.data, sections));
+        }
         const next = offset + parents.length;
         const endReached = next >= SUBBOARD_PARENTS.length;
         return { items: sections, olderCursor: endReached ? undefined : "subboards:" + next, endReached };
@@ -149,6 +156,35 @@ defineFlareSocialPlugin({
 function board(fid: string, name: string, parent?: string): TimelineDescriptorV1 {
   const id = parent ? "forum-" + parent + "-sub-" + fid : "forum-" + fid;
   return { id, title: { value: name }, icon: "Channel", parameters: { fid } };
+}
+
+function publicBoardSections(data: unknown, featured: TimelineSectionV1[]): TimelineSectionV1[] {
+  const groups = obj(rows(data)[0]?.all);
+  const seen = new Set(featured.flatMap((section) => (section.timelines.items ?? [])
+    .flatMap((timeline) => timeline.parameters?.fid ?? [])));
+  const sections: TimelineSectionV1[] = [];
+  for (const group of rows(groups)) {
+    const name = decodeLabel(group.name);
+    if (!name) continue;
+    const items = collectPublicBoards(group, seen);
+    // Flare v1 limits each section's timeline page to 200 rows.
+    for (let start = 0; start < items.length; start += 200) {
+      sections.push({ id: "index-" + sections.length, title: { value: name },
+        timelines: { items: items.slice(start, start + 200), endReached: true } });
+    }
+  }
+  return sections;
+}
+
+function collectPublicBoards(group: Row, seen: Set<string>): TimelineDescriptorV1[] {
+  return rows(group.content).flatMap((entry) => {
+    const fid = forumId(entry.fid);
+    const name = decodeLabel(entry.name);
+    if (!fid) return collectPublicBoards(entry, seen);
+    if (!name || numeric(entry.stid) || seen.has(fid)) return [];
+    seen.add(fid);
+    return [board(fid, name)];
+  });
 }
 
 async function get(path: string, cookies: Cookie[], output = 11, timeoutMillis?: number) {
@@ -307,7 +343,9 @@ function floor(row: Row, data: Awaited<ReturnType<typeof loadThread>>, id: strin
   return {
     key: key(id), author: user(uid, name, author), createdAt: time(row.postdatetimestamp),
     content: { format: "html", value: (title ? "<b>" + escape(title) + "</b><br><br>" : "") + (body || " ") },
-    media, replyTo: root ? undefined : key(data.tid),
+    // The thread already shows the main post as its own row. Reply references
+    // make Flare inline that same post above every floor in the first page.
+    media,
     repliesCount: root ? number(data.thread.replies) : undefined,
     url: ORIGIN + "/read.php?tid=" + data.tid + (root ? "" : "&pid=" + str(row.pid)),
     sourceChannel: root && str(data.forum?.name) ? { id: str(data.thread.fid), name: str(data.forum?.name) } : undefined,
