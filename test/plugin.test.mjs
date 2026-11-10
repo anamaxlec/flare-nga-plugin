@@ -4,7 +4,6 @@ import vm from "node:vm";
 import { test } from "node:test";
 
 const source = readFileSync(new URL("../plugin.js", import.meta.url), "utf8");
-const fallback = "https://img4.nga.cn/ngabbs/face/a_sheep.png";
 const page = { direction: "refresh", limit: 20 };
 const guest = { scope: "guest", credentialAvailable: false };
 const account = { scope: "account", credentialAvailable: true };
@@ -69,7 +68,8 @@ test("thread detail loads a missing signed-in author's avatar and renders the or
       } });
   const key = { id: "2", host: "bbs.nga.cn" };
   const anonymous = await post.detail({ key }, guest);
-  assert.equal(anonymous.post.author.avatarUrl, fallback);
+  assert.equal(anonymous.post.author.displayName, "A");
+  assert.equal(anonymous.post.author.avatarUrl, undefined);
   assert.equal(requests.length, 1);
   const loggedIn = await post.detail({ key }, account);
   assert.equal(loggedIn.post.author.avatarUrl, "https://img.nga.cn/avatars/2002/a20/6dc/002/40749600_123.png");
@@ -79,6 +79,42 @@ test("thread detail loads a missing signed-in author's avatar and renders the or
   assert.match(thread.items[0].post.content.value, /Original body/);
   assert.equal(thread.items[1].post.replyTo, undefined);
   assert.equal(thread.items[1].post.author.avatarUrl, "https://img4.nga.cn/ngabbs/face/a_arcane.webp");
+});
+
+test("reply text stays ahead of a compact native quote that opens the original floor", async () => {
+  const quote = "[pid=10,2,1]Reply[/pid] [b]Post by [uid=42]B[/uid] (2026-11-10 00:32):[/b]";
+  const root = { lou: 0, pid: 0, authorid: 40749600, content: "Original body" };
+  const original = { lou: 1, pid: 10, authorid: 42, content: "原楼层正文" };
+  const reply = { lou: 2, pid: 11, authorid: 43, content: "[quote]" + quote + "<br/><br/>" +
+    "引用内容".repeat(35) + "[img]./quoted.png[/img][/quote]<br/><br/>这层自己的[del]文字[/del][s:ac:哭笑]" +
+    "<br/><br/>[img]./reply.png[/img]" };
+  const direct = { lou: 3, pid: 12, authorid: 43, content: "[b]Reply to " + quote.replace("[b]", "") +
+    "<br/>直接回复正文[quote]没有楼层链接的引用[/quote]" };
+  const { post, requests } = register(() => ({ data: {
+    __T: { tid: 2, authorid: 40749600, author: "A", subject: "Original post" },
+    __R: [root, original, reply, direct],
+    __U: { 42: { username: "B", avatar: "a_sheep.png" }, 43: { username: "C" } },
+    __GLOBAL: { _ATTACH_BASE_VIEW: "img.nga.cn/attachments" },
+  } }));
+  const result = await post.context({ key: { id: "2", host: "bbs.nga.cn" }, page }, guest);
+  const [, , replyItem, directItem] = result.items;
+  assert.equal(replyItem.post.content.value, "这层自己的<del>文字</del>（哭笑）");
+  assert.equal(replyItem.post.media.length, 1);
+  assert.equal(replyItem.post.media[0].url, "https://img.nga.cn/attachments/reply.png");
+  const [preview] = replyItem.presentation.quotes;
+  assert.equal(preview.author.displayName, "B");
+  assert.equal(preview.author.avatarUrl, "https://img4.nga.cn/ngabbs/face/a_sheep.png");
+  assert.equal(preview.createdAt, "2026-11-09T16:32:00.000Z");
+  assert.notEqual(preview.key.id, "p2-10-1");
+  assert.equal(preview.detailType, "link");
+  assert.equal(preview.url, "https://bbs.nga.cn/read.php?tid=2&pid=10");
+  assert.match(preview.content.value, /…$/);
+  assert.equal(preview.content.value.length, 97);
+  assert.match(directItem.post.content.value, /^直接回复正文.*<blockquote>没有楼层链接的引用<\/blockquote>/);
+  assert.equal(directItem.presentation.quotes[0].content.value, original.content);
+  assert.equal(requests.length, 1);
+  const opened = await post.context({ key: { id: "p2-10-1", host: "bbs.nga.cn" }, page }, guest);
+  assert.equal(opened.items[0].post.content.value, original.content);
 });
 
 test("catalog includes official boards and their independent subforums while skipping topic shortcuts", async () => {

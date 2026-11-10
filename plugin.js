@@ -12,9 +12,9 @@
     "flare.datasource.profile/v1": ["byId", "byHandle"]
   };
   var LANGUAGE = ["zh-CN"];
-  var AVATAR_PLACEHOLDER = "https://img4.nga.cn/ngabbs/face/a_sheep.png";
   var FORUM_INDEX = "/nuke.php?__lib=nga_index&__act=get_all_forums";
   var SUBBOARD_BATCH_SIZE = 4;
+  var REPLY_HEADER = /^\s*(?:\[b\]\s*Reply to\s+)?\[pid=(\d+),(\d+),\d+\][^\[]*\[\/pid\]\s*(?:\[b\])?Post by\s+\[uid=(\d+)\]([^\[]+)\[\/uid\]\s*\(([^)]+)\):?\s*\[\/b\]/i;
   var BOARDS = [
     { name: "\u6E38\u620F\u8BA8\u8BBA", forums: [
       ["7", "\u827E\u6CFD\u62C9\u65AF\u8BAE\u4E8B\u5385"],
@@ -147,12 +147,12 @@
       },
       post: {
         async detail({ key: { id } }, context) {
-          return { post: await loadPost(id, context) };
+          return loadPost(id, context);
         },
         async context({ key: { id }, page }, context) {
           const ref = postRef(id);
           if (ref.pid) {
-            const items2 = page.direction === "refresh" ? [{ type: "post", post: await loadPost(id, context) }] : [];
+            const items2 = page.direction === "refresh" ? [{ type: "post", ...await loadPost(id, context) }] : [];
             return { items: items2, endReached: true };
           }
           const position = cursor(page);
@@ -162,7 +162,7 @@
             const root = number(row.lou) === 0;
             if (root ? position.batch !== 1 : !pid) return [];
             const keyId = root ? ref.tid : "p" + ref.tid + "-" + pid + "-" + position.batch;
-            return [{ type: "post", post: floor(row, data, keyId) }];
+            return [{ type: "post", ...floor(row, data, keyId) }];
           });
           return slice(items, page, position, data.hasMore);
         }
@@ -332,7 +332,9 @@
     const name = row.author || (root ? data.thread.author : "") || author?.username;
     const media = [];
     const title = root ? str(data.thread.subject || row.subject) : "";
-    const body = str(row.content).replace(/<(script|style|iframe)\b[^>]*>[\s\S]*?<\/\1>/gi, "").replace(/\[img(?:=[^\]]*)?\]([^\[]+)\[\/img\]/gi, (_, source) => {
+    const raw = str(row.content).replace(/<(script|style|iframe)\b[^>]*>[\s\S]*?<\/\1>/gi, "");
+    const { text, quotes } = separateQuotes(raw, data);
+    const body = trimBreaks(text.replace(/\[img(?:=[^\]]*)?\]([^\[]+)\[\/img\]/gi, (_, source) => {
       const url = mediaUrl(source, data.attachmentHost);
       if (url && media.length < 12 && !media.some((image) => image.url === url)) {
         media.push({ id: id + "-m" + media.length, type: /\.gif(?:$|[?#])/i.test(url) ? "gif" : "image", url });
@@ -341,20 +343,76 @@
     }).replace(/\[url=([^\]]+)\]([\s\S]*?)\[\/url\]/gi, (_, source, title2) => {
       const url = https(source);
       return url ? '<a href="' + escape(url) + '">' + title2 + "</a>" : title2;
-    }).replace(/\[\/?(?:quote|b|i|u|s)(?:=[^\]]*)?\]/gi, (tag) => tag.toLowerCase().replace("quote", "blockquote").replace(/\[|\]/g, (ch) => ch === "[" ? "<" : ">").replace(/=[^>]+/, "")).replace(/\[\/?(?:size|font|color|align|collapse)(?:=[^\]]*)?\]/gi, "").replace(/(?:<br\s*\/?\s*>\s*){3,}/gi, "<br><br>").trim();
+    }).replace(/\[pid=(\d+),(\d+),\d+\]([^\[]*)\[\/pid\]/gi, (_, pid, tid, label) => '<a href="' + escape(floorUrl(tid, pid)) + '">' + (label === "Reply" ? "\u67E5\u770B\u539F\u56DE\u590D" : label) + "</a>").replace(/\[uid=\d+\]|\[\/uid\]/gi, "").replace(/\[s:[\w-]+:([^\[\]<>&]+)\]/gi, "\uFF08$1\uFF09").replace(/\[(\/?)(quote|b|i|u|s|del)(?:=[^\]]*)?\]/gi, (_, close, tag) => "<" + close + (tag.toLowerCase() === "quote" ? "blockquote" : tag.toLowerCase()) + ">").replace(/\[\/?(?:size|font|color|align|collapse)(?:=[^\]]*)?\]/gi, "").replace(/(?:<br\s*\/?\s*>\s*){3,}/gi, "<br><br>"));
     return {
-      key: key(id),
-      author: user(uid, name, author),
-      createdAt: time(row.postdatetimestamp),
-      content: { format: "html", value: (title ? "<b>" + escape(title) + "</b><br><br>" : "") + (body || " ") },
-      // The thread already shows the main post as its own row. Reply references
-      // make Flare inline that same post above every floor in the first page.
-      media,
-      repliesCount: root ? number(data.thread.replies) : void 0,
-      url: ORIGIN + "/read.php?tid=" + data.tid + (root ? "" : "&pid=" + str(row.pid)),
-      sourceChannel: root && str(data.forum?.name) ? { id: str(data.thread.fid), name: str(data.forum?.name) } : void 0,
+      post: {
+        key: key(id),
+        author: user(uid, name, author),
+        createdAt: time(row.postdatetimestamp),
+        content: { format: "html", value: (title ? "<b>" + escape(title) + "</b><br><br>" : "") + (body || " ") },
+        media,
+        repliesCount: root ? number(data.thread.replies) : void 0,
+        url: floorUrl(data.tid, root ? "0" : str(row.pid)),
+        sourceChannel: root && str(data.forum?.name) ? { id: str(data.thread.fid), name: str(data.forum?.name) } : void 0,
+        sourceLanguages: LANGUAGE
+      },
+      presentation: quotes.length ? { quotes } : void 0
+    };
+  }
+  function separateQuotes(content, data) {
+    const quotes = [];
+    const unlinked = [];
+    const direct = REPLY_HEADER.exec(content);
+    const bodyStart = direct?.[0].length ?? 0;
+    if (direct) quotes.push(quotedFloor(direct, "", data));
+    let offset = bodyStart;
+    let text = "";
+    let depth = 0;
+    let start = 0;
+    let inner = 0;
+    for (const tag of content.slice(bodyStart).matchAll(/\[(\/?)quote(?:=[^\]]*)?\]/gi)) {
+      const index = tag.index + bodyStart;
+      const end = index + tag[0].length;
+      if (!tag[1]) {
+        if (depth++ === 0) {
+          start = index;
+          inner = end;
+        }
+      } else if (depth > 0 && --depth === 0) {
+        text += content.slice(offset, start);
+        const excerpt = content.slice(inner, index);
+        const header = REPLY_HEADER.exec(excerpt);
+        if (header) quotes.push(quotedFloor(header, excerpt.slice(header[0].length), data));
+        else unlinked.push(content.slice(start, end));
+        offset = end;
+      }
+    }
+    return { text: [trimBreaks(text + content.slice(offset)), ...unlinked].filter(Boolean).join("<br><br>"), quotes };
+  }
+  function quotedFloor(header, excerpt, data) {
+    const [, pid, tid, uid, name, date] = header;
+    const source = data.tid === tid ? data.replies.find((row) => str(row.pid) === pid) : void 0;
+    const body = excerpt || str(source?.content).replace(REPLY_HEADER, "");
+    const plain = decodeLabel(body.replace(/\[img(?:=[^\]]*)?\][\s\S]*?\[\/img\]/gi, " [\u56FE\u7247] ").replace(/\[pid=[^\]]+\][\s\S]*?\[\/pid\]/gi, "").replace(/\[s:[\w-]+:([^\[\]<>&]+)\]/gi, "\uFF08$1\uFF09").replace(/<br\b[^>]*>|<\/p>/gi, " ").replace(/<[^>]*>|\[\/?[a-z][a-z\d_]*(?:=[^\]]*)?\]/gi, "")).replace(/\s+/g, " ");
+    const characters = Array.from(plain);
+    const preview = characters.length > 96 ? characters.slice(0, 96).join("").trimEnd() + "\u2026" : plain;
+    const timestamp = number(source?.postdatetimestamp) ?? Date.parse(date.replace(" ", "T") + "+08:00") / 1e3;
+    return {
+      // Flare caches quote cards by key. Keep the preview separate from the full floor.
+      key: key("quote-" + tid + "-" + pid),
+      author: user(numeric(uid), decodeLabel(name), obj(data.users[uid])),
+      createdAt: time(timestamp),
+      content: { format: "plain", value: preview || "\u67E5\u770B\u539F\u697C\u5C42" },
+      url: floorUrl(tid, pid),
+      detailType: "link",
       sourceLanguages: LANGUAGE
     };
+  }
+  function trimBreaks(text) {
+    return text.trim().replace(/^(?:<br\s*\/?\s*>\s*)+|(?:\s*<br\s*\/?\s*>)+$/gi, "").trim();
+  }
+  function floorUrl(tid, pid) {
+    return ORIGIN + "/read.php?tid=" + tid + (pid === "0" ? "" : "&pid=" + pid);
   }
   function user(uid, value, profile) {
     if (!uid) return void 0;
@@ -363,7 +421,7 @@
       key: key(uid),
       handle: uid,
       displayName: name,
-      avatarUrl: avatarUrl(str(profile?.avatar)) ?? AVATAR_PLACEHOLDER,
+      avatarUrl: avatarUrl(str(profile?.avatar)),
       followersCount: number(profile?.follow_by_num),
       url: ORIGIN + "/nuke.php?__lib=ucp&__act=get&uid=" + uid
     };

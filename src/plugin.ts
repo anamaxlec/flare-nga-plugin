@@ -9,9 +9,10 @@ const CAPS = {
   "flare.datasource.profile/v1": ["byId", "byHandle"],
 };
 const LANGUAGE = ["zh-CN"];
-const AVATAR_PLACEHOLDER = "https://img4.nga.cn/ngabbs/face/a_sheep.png";
 const FORUM_INDEX = "/nuke.php?__lib=nga_index&__act=get_all_forums";
 const SUBBOARD_BATCH_SIZE = 4;
+// NGA uses the same floor metadata for quoted posts and standalone "Reply to" headers.
+const REPLY_HEADER = /^\s*(?:\[b\]\s*Reply to\s+)?\[pid=(\d+),(\d+),\d+\][^\[]*\[\/pid\]\s*(?:\[b\])?Post by\s+\[uid=(\d+)\]([^\[]+)\[\/uid\]\s*\(([^)]+)\):?\s*\[\/b\]/i;
 const BOARDS = [
   { name: "游戏讨论", forums: [
     ["7", "艾泽拉斯议事厅"], ["310", "精英议会"], ["510569", "魔兽世界：无限"],
@@ -131,11 +132,11 @@ defineFlareSocialPlugin({
       },
     },
     post: {
-      async detail({ key: { id } }, context) { return { post: await loadPost(id, context) }; },
+      async detail({ key: { id } }, context) { return loadPost(id, context); },
       async context({ key: { id }, page }, context) {
         const ref = postRef(id);
         if (ref.pid) {
-          const items: TimelineItemV1[] = page.direction === "refresh" ? [{ type: "post", post: await loadPost(id, context) }] : [];
+          const items: TimelineItemV1[] = page.direction === "refresh" ? [{ type: "post", ...await loadPost(id, context) }] : [];
           return { items, endReached: true };
         }
         const position = cursor(page);
@@ -145,7 +146,7 @@ defineFlareSocialPlugin({
           const root = number(row.lou) === 0;
           if (root ? position.batch !== 1 : !pid) return [];
           const keyId = root ? ref.tid : "p" + ref.tid + "-" + pid + "-" + position.batch;
-          return [{ type: "post", post: floor(row, data, keyId) }];
+          return [{ type: "post", ...floor(row, data, keyId) }];
         });
         return slice(items, page, position, data.hasMore);
       },
@@ -268,7 +269,7 @@ async function loadThread(tid: string, batch: number, context: PluginInvocationC
   };
 }
 
-async function loadPost(id: string, context: PluginInvocationContextV1): Promise<PostV1> {
+async function loadPost(id: string, context: PluginInvocationContextV1): Promise<TimelinePostV1> {
   const { tid, pid, batch } = postRef(id);
   const thread = await loadThread(tid, batch, context, !pid);
   const row = thread.replies.find((row) => pid ? numeric(row.pid) === pid : number(row.lou) === 0);
@@ -317,14 +318,16 @@ function decodeLabel(value: unknown): string {
     ({ amp: "&", quot: '"', lt: "<", gt: ">", nbsp: " ", "#39": "'" })[entity] ?? "").trim();
 }
 
-function floor(row: Row, data: Awaited<ReturnType<typeof loadThread>>, id: string): PostV1 {
+function floor(row: Row, data: Awaited<ReturnType<typeof loadThread>>, id: string): TimelinePostV1 {
   const root = data.tid === id;
   const uid = numeric(row.authorid) ?? (root ? numeric(data.thread.authorid) : undefined);
   const author = obj(uid ? data.users[uid] : undefined);
   const name = row.author || (root ? data.thread.author : "") || author?.username;
   const media: MediaV1[] = [];
   const title = root ? str(data.thread.subject || row.subject) : "";
-  const body = str(row.content).replace(/<(script|style|iframe)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+  const raw = str(row.content).replace(/<(script|style|iframe)\b[^>]*>[\s\S]*?<\/\1>/gi, "");
+  const { text, quotes } = separateQuotes(raw, data);
+  const body = trimBreaks(text
     .replace(/\[img(?:=[^\]]*)?\]([^\[]+)\[\/img\]/gi, (_, source: string) => {
       const url = mediaUrl(source, data.attachmentHost);
       if (url && media.length < 12 && !media.some((image) => image.url === url)) {
@@ -336,21 +339,85 @@ function floor(row: Row, data: Awaited<ReturnType<typeof loadThread>>, id: strin
       const url = https(source);
       return url ? '<a href="' + escape(url) + '">' + title + "</a>" : title;
     })
-    .replace(/\[\/?(?:quote|b|i|u|s)(?:=[^\]]*)?\]/gi, (tag) => tag.toLowerCase().replace("quote", "blockquote").replace(/\[|\]/g, (ch) => ch === "[" ? "<" : ">").replace(/=[^>]+/, ""))
+    .replace(/\[pid=(\d+),(\d+),\d+\]([^\[]*)\[\/pid\]/gi, (_, pid: string, tid: string, label: string) =>
+      '<a href="' + escape(floorUrl(tid, pid)) + '">' + (label === "Reply" ? "查看原回复" : label) + "</a>")
+    .replace(/\[uid=\d+\]|\[\/uid\]/gi, "")
+    .replace(/\[s:[\w-]+:([^\[\]<>&]+)\]/gi, "（$1）")
+    .replace(/\[(\/?)(quote|b|i|u|s|del)(?:=[^\]]*)?\]/gi, (_, close: string, tag: string) =>
+      "<" + close + (tag.toLowerCase() === "quote" ? "blockquote" : tag.toLowerCase()) + ">")
     .replace(/\[\/?(?:size|font|color|align|collapse)(?:=[^\]]*)?\]/gi, "")
-    .replace(/(?:<br\s*\/?\s*>\s*){3,}/gi, "<br><br>")
-    .trim();
+    .replace(/(?:<br\s*\/?\s*>\s*){3,}/gi, "<br><br>"));
   return {
-    key: key(id), author: user(uid, name, author), createdAt: time(row.postdatetimestamp),
-    content: { format: "html", value: (title ? "<b>" + escape(title) + "</b><br><br>" : "") + (body || " ") },
-    // The thread already shows the main post as its own row. Reply references
-    // make Flare inline that same post above every floor in the first page.
-    media,
-    repliesCount: root ? number(data.thread.replies) : undefined,
-    url: ORIGIN + "/read.php?tid=" + data.tid + (root ? "" : "&pid=" + str(row.pid)),
-    sourceChannel: root && str(data.forum?.name) ? { id: str(data.thread.fid), name: str(data.forum?.name) } : undefined,
-    sourceLanguages: LANGUAGE,
+    post: {
+      key: key(id), author: user(uid, name, author), createdAt: time(row.postdatetimestamp),
+      content: { format: "html", value: (title ? "<b>" + escape(title) + "</b><br><br>" : "") + (body || " ") },
+      media,
+      repliesCount: root ? number(data.thread.replies) : undefined,
+      url: floorUrl(data.tid, root ? "0" : str(row.pid)),
+      sourceChannel: root && str(data.forum?.name) ? { id: str(data.thread.fid), name: str(data.forum?.name) } : undefined,
+      sourceLanguages: LANGUAGE,
+    },
+    presentation: quotes.length ? { quotes } : undefined,
   };
+}
+
+function separateQuotes(content: string, data: Awaited<ReturnType<typeof loadThread>>) {
+  const quotes: PostV1[] = [];
+  const unlinked: string[] = [];
+  const direct = REPLY_HEADER.exec(content);
+  const bodyStart = direct?.[0].length ?? 0;
+  if (direct) quotes.push(quotedFloor(direct, "", data));
+  let offset = bodyStart;
+  let text = "";
+  let depth = 0;
+  let start = 0;
+  let inner = 0;
+  for (const tag of content.slice(bodyStart).matchAll(/\[(\/?)quote(?:=[^\]]*)?\]/gi)) {
+    const index = tag.index + bodyStart;
+    const end = index + tag[0].length;
+    if (!tag[1]) {
+      if (depth++ === 0) { start = index; inner = end; }
+    } else if (depth > 0 && --depth === 0) {
+      text += content.slice(offset, start);
+      const excerpt = content.slice(inner, index);
+      const header = REPLY_HEADER.exec(excerpt);
+      if (header) quotes.push(quotedFloor(header, excerpt.slice(header[0].length), data));
+      else unlinked.push(content.slice(start, end));
+      offset = end;
+    }
+  }
+  return { text: [trimBreaks(text + content.slice(offset)), ...unlinked].filter(Boolean).join("<br><br>"), quotes };
+}
+
+function quotedFloor(header: RegExpExecArray, excerpt: string, data: Awaited<ReturnType<typeof loadThread>>): PostV1 {
+  const [, pid, tid, uid, name, date] = header;
+  const source = data.tid === tid ? data.replies.find((row) => str(row.pid) === pid) : undefined;
+  const body = excerpt || str(source?.content).replace(REPLY_HEADER, "");
+  const plain = decodeLabel(body
+    .replace(/\[img(?:=[^\]]*)?\][\s\S]*?\[\/img\]/gi, " [图片] ")
+    .replace(/\[pid=[^\]]+\][\s\S]*?\[\/pid\]/gi, "")
+    .replace(/\[s:[\w-]+:([^\[\]<>&]+)\]/gi, "（$1）")
+    .replace(/<br\b[^>]*>|<\/p>/gi, " ")
+    .replace(/<[^>]*>|\[\/?[a-z][a-z\d_]*(?:=[^\]]*)?\]/gi, ""))
+    .replace(/\s+/g, " ");
+  const characters = Array.from(plain);
+  const preview = characters.length > 96 ? characters.slice(0, 96).join("").trimEnd() + "…" : plain;
+  const timestamp = number(source?.postdatetimestamp) ?? Date.parse(date.replace(" ", "T") + "+08:00") / 1000;
+  return {
+    // Flare caches quote cards by key. Keep the preview separate from the full floor.
+    key: key("quote-" + tid + "-" + pid),
+    author: user(numeric(uid), decodeLabel(name), obj(data.users[uid])), createdAt: time(timestamp),
+    content: { format: "plain", value: preview || "查看原楼层" },
+    url: floorUrl(tid, pid), detailType: "link", sourceLanguages: LANGUAGE,
+  };
+}
+
+function trimBreaks(text: string): string {
+  return text.trim().replace(/^(?:<br\s*\/?\s*>\s*)+|(?:\s*<br\s*\/?\s*>)+$/gi, "").trim();
+}
+
+function floorUrl(tid: string, pid: string): string {
+  return ORIGIN + "/read.php?tid=" + tid + (pid === "0" ? "" : "&pid=" + pid);
 }
 
 function user(uid: string | undefined, value: unknown, profile?: Row): ProfileV1 | undefined {
@@ -358,7 +425,7 @@ function user(uid: string | undefined, value: unknown, profile?: Row): ProfileV1
   const name = str(value).trim() || "UID " + uid;
   return {
     key: key(uid), handle: uid, displayName: name,
-    avatarUrl: avatarUrl(str(profile?.avatar)) ?? AVATAR_PLACEHOLDER,
+    avatarUrl: avatarUrl(str(profile?.avatar)),
     followersCount: number(profile?.follow_by_num),
     url: ORIGIN + "/nuke.php?__lib=ucp&__act=get&uid=" + uid,
   };
