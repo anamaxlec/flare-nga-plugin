@@ -75,22 +75,18 @@
           const fid = forumId(request.parameters?.fid ?? request.page.parameters?.fid);
           if (fid === void 0) fail("Validation", "\u6CA1\u6709\u6307\u5B9A NGA \u7248\u9762");
           const position = cursor(request.page);
-          const cookies = await cookiesFor(context);
-          const data = await api("/thread.php?fid=" + fid + "&page=" + position.batch, context, cookies);
-          const users = obj(data.__U);
+          const data = await api("/thread.php?fid=" + fid + "&page=" + position.batch, context);
           const forum = obj(data.__F);
-          const name = str(forum?.name) || BOARDS.flatMap(({ forums }) => [...forums]).find(([id]) => id === fid)?.[1];
+          const name = str(forum?.name) || boardName(fid);
           const topics = rows(data.__T);
           const items = topics.flatMap((thread) => {
             const tid = numeric(thread.tid);
             if (!tid || position.batch > 1 && (Number(thread.type) & 5120) !== 0) return [];
-            return [{ type: "post", post: preview(thread, tid, str(name), obj(users?.[str(thread.authorid)])) }];
+            return [{ type: "feed", feed: topicFeed(thread, tid, fid, name, forum) }];
           });
           const total = number(data.__ROWS);
           const batchSize = number(data.__T__ROWS_PAGE) ?? 35;
-          const result = slice(items, request.page, position, topics.length > 0 && total !== void 0 && position.batch * batchSize < total);
-          if (cookies.length) await loadListAvatars(result.items ?? [], cookies);
-          return result;
+          return slice(items, request.page, position, topics.length > 0 && total !== void 0 && position.batch * batchSize < total);
         }
       },
       tabCatalog: {
@@ -107,7 +103,7 @@
           const children = await Promise.all(parents.map(async (fid) => {
             const data = await api("/thread.php?fid=" + fid + "&page=1", context, cookies).catch(() => void 0);
             const forum = obj(data?.__F);
-            const name = str(forum?.name) || BOARDS.flatMap(({ forums }) => [...forums]).find(([id]) => id === fid)?.[1];
+            const name = str(forum?.name) || boardName(fid);
             if (!name) return void 0;
             const items = Object.entries(obj(forum?.sub_forums) ?? {}).flatMap(([entry, value]) => {
               const row = list(value);
@@ -153,12 +149,12 @@
             return { items: items2, endReached: true };
           }
           const position = cursor(page);
-          const data = await loadThread(ref.tid, position.batch, context);
+          const data = await loadThread(ref.tid, position.batch, context, position.batch === 1 && position.skip === 0);
           const items = data.replies.flatMap((row) => {
             const pid = numeric(row.pid);
-            if (!pid && number(row.lou) !== 0) return [];
-            const keyId = pid ? "p" + ref.tid + "-" + pid + "-" + position.batch : ref.tid;
-            if (keyId === ref.tid && position.batch !== 1) return [];
+            const root = number(row.lou) === 0;
+            if (root ? position.batch !== 1 : !pid) return [];
+            const keyId = root ? ref.tid : "p" + ref.tid + "-" + pid + "-" + position.batch;
             return [{ type: "post", post: floor(row, data, keyId) }];
           });
           return slice(items, page, position, data.hasMore);
@@ -221,43 +217,31 @@
     const { root } = await get("/nuke.php?__lib=ucp&__act=get&uid=" + uid, cookies, 14, timeoutMillis);
     return rows(root?.result).find((profile) => numeric(profile.uid) === uid);
   }
-  async function loadListAvatars(items, cookies) {
-    const authors = /* @__PURE__ */ new Map();
-    for (const item of items) {
-      if (item.type !== "post" || item.post.author?.avatarUrl !== AVATAR_PLACEHOLDER) continue;
-      const author = item.post.author;
-      const id = author.key.id;
-      const group = authors.get(id) ?? [];
-      group.push(author);
-      authors.set(id, group);
-    }
-    const pending = [...authors].slice(0, 20);
-    for (let offset = 0; offset < pending.length; offset += 5) {
-      await Promise.all(pending.slice(offset, offset + 5).map(async ([uid, profiles]) => {
-        const user2 = await accountProfile(uid, cookies, 2e3).catch(() => void 0);
-        const url = avatarUrl(str(user2?.avatar));
-        if (url) for (const profile of profiles) profile.avatarUrl = url;
-      }));
-    }
-  }
   function publicProfile(row) {
     const profile = user(numeric(row?.uid), row?.username, row);
     if (!profile) fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u4E2A NGA \u7528\u6237");
     return profile;
   }
-  async function loadThread(tid, batch, context) {
-    const data = await api("/read.php?tid=" + tid + "&page=" + batch, context);
+  async function loadThread(tid, batch, context, withAuthorAvatar) {
+    const cookies = await cookiesFor(context);
+    const data = await api("/read.php?tid=" + tid + "&page=" + batch, context, cookies);
     const thread = obj(data.__T);
     const replies = rows(data.__R);
     if (!thread || !replies.length) fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u7BC7\u5E16\u5B50\u6216\u697C\u5C42");
     const size = number(data.__R__ROWS_PAGE) ?? 20;
     const total = number(data.__ROWS);
+    const users = obj(data.__U) ?? {};
+    const authorId = numeric(replies.find((row) => number(row.lou) === 0)?.authorid) ?? numeric(thread.authorid);
+    if (withAuthorAvatar && cookies.length && authorId && !avatarUrl(str(obj(users[authorId])?.avatar))) {
+      const profile = await accountProfile(authorId, cookies, 2e3).catch(() => void 0);
+      if (profile?.avatar) users[authorId] = { ...obj(users[authorId]), avatar: profile.avatar };
+    }
     return {
       tid,
       batch,
       thread,
       replies,
-      users: obj(data.__U) ?? {},
+      users,
       forum: obj(data.__F),
       attachmentHost: str(obj(data.__GLOBAL)?._ATTACH_BASE_VIEW),
       hasMore: total !== void 0 ? batch * size < total : replies.length >= size
@@ -265,7 +249,7 @@
   }
   async function loadPost(id, context) {
     const { tid, pid, batch } = postRef(id);
-    const thread = await loadThread(tid, batch, context);
+    const thread = await loadThread(tid, batch, context, !pid);
     const row = thread.replies.find((row2) => pid ? numeric(row2.pid) === pid : number(row2.lou) === 0);
     if (!row) fail("NotFound", "\u627E\u4E0D\u5230\u8FD9\u4E2A\u697C\u5C42");
     return floor(row, thread, id);
@@ -276,22 +260,39 @@
     if (!reply) fail("NotFound", "\u65E0\u6CD5\u8BC6\u522B\u8FD9\u4E2A\u5E16\u5B50");
     return { tid: reply[1], pid: reply[2], batch: Number(reply[3]) };
   }
-  function preview(thread, tid, forum, profile) {
-    const title = str(thread.subject);
+  function boardName(fid) {
+    return BOARDS.flatMap(({ forums }) => [...forums]).find(([id]) => id === fid)?.[1] ?? "";
+  }
+  function topicFeed(thread, tid, currentFid, currentName, forum) {
+    const parentName = decodeLabel(obj(thread.parent)?.["2"] ?? list(thread.parent)[2]);
+    const mirror = parentName === "\u7248\u9762\u955C\u50CF" ? forumId(obj(thread.topic_misc_var)?.["3"] ?? list(thread.topic_misc_var)[3]) : void 0;
+    const title = decodeLabel(thread.subject) || "NGA \u4E3B\u9898";
+    const createdAt = time(number(thread.lastpost) || thread.postdate);
+    const threadId = numeric(thread.quote_from) ?? tid;
+    const external = mirror ? ORIGIN + "/thread.php?fid=" + mirror : https(str(thread.jumpurl));
+    const url = external ?? ORIGIN + "/read.php?tid=" + threadId;
+    const sourceFid = forumId(thread.fid) ?? currentFid;
+    const childName = decodeLabel(list(obj(forum?.sub_forums)?.[sourceFid])[1]);
+    const source = parentName || childName || (sourceFid === currentFid ? decodeLabel(currentName) : boardName(sourceFid));
+    const author = decodeLabel(thread.author);
+    const replies = number(thread.replies);
+    const metadata = mirror ? "" : [author, replies === void 0 ? "" : replies + " \u6761\u56DE\u590D"].filter(Boolean).join(" \xB7 ");
     return {
-      key: key(tid),
-      author: user(numeric(thread.authorid), thread.author, profile),
-      createdAt: time(thread.postdate),
-      content: { format: "html", value: "<b>" + escape(title) + "</b>" },
-      repliesCount: number(thread.replies),
-      url: ORIGIN + "/read.php?tid=" + tid,
-      sourceChannel: forum ? { id: str(thread.fid), name: forum } : void 0,
+      title,
+      url,
+      createdAt,
+      source: { name: source || "NGA" },
+      description: metadata ? { format: "plain", value: metadata } : void 0,
+      target: external ? { type: "link", url } : { type: "post", key: key(threadId) },
       sourceLanguages: LANGUAGE
     };
   }
+  function decodeLabel(value) {
+    return str(value).replace(/&(amp|quot|lt|gt|nbsp|#39);/g, (_, entity) => ({ amp: "&", quot: '"', lt: "<", gt: ">", nbsp: " ", "#39": "'" })[entity] ?? "").trim();
+  }
   function floor(row, data, id) {
     const root = data.tid === id;
-    const uid = numeric(row.authorid);
+    const uid = numeric(row.authorid) ?? (root ? numeric(data.thread.authorid) : void 0);
     const author = obj(uid ? data.users[uid] : void 0);
     const name = row.author || (root ? data.thread.author : "") || author?.username;
     const media = [];

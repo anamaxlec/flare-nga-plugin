@@ -61,22 +61,18 @@ defineFlareSocialPlugin({
         const fid = forumId(request.parameters?.fid ?? request.page.parameters?.fid);
         if (fid === undefined) fail("Validation", "没有指定 NGA 版面");
         const position = cursor(request.page);
-        const cookies = await cookiesFor(context);
-        const data = await api("/thread.php?fid=" + fid + "&page=" + position.batch, context, cookies);
-        const users = obj(data.__U);
+        const data = await api("/thread.php?fid=" + fid + "&page=" + position.batch, context);
         const forum = obj(data.__F);
-        const name = str(forum?.name) || BOARDS.flatMap(({ forums }) => [...forums]).find(([id]) => id === fid)?.[1];
+        const name = str(forum?.name) || boardName(fid);
         const topics = rows(data.__T);
         const items: TimelineItemV1[] = topics.flatMap((thread) => {
           const tid = numeric(thread.tid);
           if (!tid || (position.batch > 1 && (Number(thread.type) & 5120) !== 0)) return [];
-          return [{ type: "post", post: preview(thread, tid, str(name), obj(users?.[str(thread.authorid)])) }];
+          return [{ type: "feed", feed: topicFeed(thread, tid, fid, name, forum) }];
         });
         const total = number(data.__ROWS);
         const batchSize = number(data.__T__ROWS_PAGE) ?? 35;
-        const result = slice(items, request.page, position, topics.length > 0 && total !== undefined && position.batch * batchSize < total);
-        if (cookies.length) await loadListAvatars(result.items ?? [], cookies);
-        return result;
+        return slice(items, request.page, position, topics.length > 0 && total !== undefined && position.batch * batchSize < total);
       },
     },
     tabCatalog: {
@@ -92,7 +88,7 @@ defineFlareSocialPlugin({
         const children = await Promise.all(parents.map(async (fid) => {
           const data = await api("/thread.php?fid=" + fid + "&page=1", context, cookies).catch(() => undefined);
           const forum = obj(data?.__F);
-          const name = str(forum?.name) || BOARDS.flatMap(({ forums }) => [...forums]).find(([id]) => id === fid)?.[1];
+          const name = str(forum?.name) || boardName(fid);
           if (!name) return undefined;
           const items = Object.entries(obj(forum?.sub_forums) ?? {}).flatMap(([entry, value]) => {
             const row = list(value);
@@ -136,12 +132,12 @@ defineFlareSocialPlugin({
           return { items, endReached: true };
         }
         const position = cursor(page);
-        const data = await loadThread(ref.tid, position.batch, context);
+        const data = await loadThread(ref.tid, position.batch, context, position.batch === 1 && position.skip === 0);
         const items: TimelineItemV1[] = data.replies.flatMap((row) => {
           const pid = numeric(row.pid);
-          if (!pid && number(row.lou) !== 0) return [];
-          const keyId = pid ? "p" + ref.tid + "-" + pid + "-" + position.batch : ref.tid;
-          if (keyId === ref.tid && position.batch !== 1) return [];
+          const root = number(row.lou) === 0;
+          if (root ? position.batch !== 1 : !pid) return [];
+          const keyId = root ? ref.tid : "p" + ref.tid + "-" + pid + "-" + position.batch;
           return [{ type: "post", post: floor(row, data, keyId) }];
         });
         return slice(items, page, position, data.hasMore);
@@ -209,42 +205,28 @@ async function accountProfile(uid: string, cookies: Cookie[], timeoutMillis?: nu
   return rows(root?.result).find((profile) => numeric(profile.uid) === uid);
 }
 
-async function loadListAvatars(items: TimelineItemV1[], cookies: Cookie[]) {
-  const authors = new Map<string, ProfileV1[]>();
-  for (const item of items) {
-    if (item.type !== "post" || item.post.author?.avatarUrl !== AVATAR_PLACEHOLDER) continue;
-    const author = item.post.author;
-    const id = author.key.id;
-    const group = authors.get(id) ?? [];
-    group.push(author);
-    authors.set(id, group);
-  }
-  // The UCP endpoint accepts one UID per call. Bound the additional work to the visible page.
-  const pending = [...authors].slice(0, 20);
-  for (let offset = 0; offset < pending.length; offset += 5) {
-    await Promise.all(pending.slice(offset, offset + 5).map(async ([uid, profiles]) => {
-      const user = await accountProfile(uid, cookies, 2_000).catch(() => undefined);
-      const url = avatarUrl(str(user?.avatar));
-      if (url) for (const profile of profiles) profile.avatarUrl = url;
-    }));
-  }
-}
-
 function publicProfile(row: Row | undefined): ProfileV1 {
   const profile = user(numeric(row?.uid), row?.username, row);
   if (!profile) fail("NotFound", "找不到这个 NGA 用户");
   return profile;
 }
 
-async function loadThread(tid: string, batch: number, context: PluginInvocationContextV1) {
-  const data = await api("/read.php?tid=" + tid + "&page=" + batch, context);
+async function loadThread(tid: string, batch: number, context: PluginInvocationContextV1, withAuthorAvatar: boolean) {
+  const cookies = await cookiesFor(context);
+  const data = await api("/read.php?tid=" + tid + "&page=" + batch, context, cookies);
   const thread = obj(data.__T);
   const replies = rows(data.__R);
   if (!thread || !replies.length) fail("NotFound", "找不到这篇帖子或楼层");
   const size = number(data.__R__ROWS_PAGE) ?? 20;
   const total = number(data.__ROWS);
+  const users = obj(data.__U) ?? {};
+  const authorId = numeric(replies.find((row) => number(row.lou) === 0)?.authorid) ?? numeric(thread.authorid);
+  if (withAuthorAvatar && cookies.length && authorId && !avatarUrl(str(obj(users[authorId])?.avatar))) {
+    const profile = await accountProfile(authorId, cookies, 2_000).catch(() => undefined);
+    if (profile?.avatar) users[authorId] = { ...obj(users[authorId]), avatar: profile.avatar };
+  }
   return {
-    tid, batch, thread, replies, users: obj(data.__U) ?? {}, forum: obj(data.__F),
+    tid, batch, thread, replies, users, forum: obj(data.__F),
     attachmentHost: str(obj(data.__GLOBAL)?._ATTACH_BASE_VIEW),
     hasMore: total !== undefined ? batch * size < total : replies.length >= size,
   };
@@ -252,7 +234,7 @@ async function loadThread(tid: string, batch: number, context: PluginInvocationC
 
 async function loadPost(id: string, context: PluginInvocationContextV1): Promise<PostV1> {
   const { tid, pid, batch } = postRef(id);
-  const thread = await loadThread(tid, batch, context);
+  const thread = await loadThread(tid, batch, context, !pid);
   const row = thread.replies.find((row) => pid ? numeric(row.pid) === pid : number(row.lou) === 0);
   if (!row) fail("NotFound", "找不到这个楼层");
   return floor(row, thread, id);
@@ -265,22 +247,43 @@ function postRef(id: string) {
   return { tid: reply[1], pid: reply[2], batch: Number(reply[3]) };
 }
 
-function preview(thread: Row, tid: string, forum: string, profile?: Row): PostV1 {
-  const title = str(thread.subject);
+function boardName(fid: string): string {
+  return BOARDS.flatMap(({ forums }) => [...forums]).find(([id]) => id === fid)?.[1] ?? "";
+}
+
+function topicFeed(thread: Row, tid: string, currentFid: string, currentName: string, forum?: Row): FeedV1 {
+  const parentName = decodeLabel(obj(thread.parent)?.["2"] ?? list(thread.parent)[2]);
+  const mirror = parentName === "版面镜像"
+    ? forumId(obj(thread.topic_misc_var)?.["3"] ?? list(thread.topic_misc_var)[3])
+    : undefined;
+  const title = decodeLabel(thread.subject) || "NGA 主题";
+  const createdAt = time(number(thread.lastpost) || thread.postdate);
+  const threadId = numeric(thread.quote_from) ?? tid;
+  const external = mirror ? ORIGIN + "/thread.php?fid=" + mirror : https(str(thread.jumpurl));
+  const url = external ?? ORIGIN + "/read.php?tid=" + threadId;
+  const sourceFid = forumId(thread.fid) ?? currentFid;
+  const childName = decodeLabel(list(obj(forum?.sub_forums)?.[sourceFid])[1]);
+  const source = parentName || childName || (sourceFid === currentFid ? decodeLabel(currentName) : boardName(sourceFid));
+  const author = decodeLabel(thread.author);
+  const replies = number(thread.replies);
+  const metadata = mirror ? "" : [author, replies === undefined ? "" : replies + " 条回复"].filter(Boolean).join(" · ");
   return {
-    key: key(tid), author: user(numeric(thread.authorid), thread.author, profile),
-    createdAt: time(thread.postdate),
-    content: { format: "html", value: "<b>" + escape(title) + "</b>" },
-    repliesCount: number(thread.replies),
-    url: ORIGIN + "/read.php?tid=" + tid,
-    sourceChannel: forum ? { id: str(thread.fid), name: forum } : undefined,
+    title, url, createdAt,
+    source: { name: source || "NGA" },
+    description: metadata ? { format: "plain", value: metadata } : undefined,
+    target: external ? { type: "link", url } : { type: "post", key: key(threadId) },
     sourceLanguages: LANGUAGE,
   };
 }
 
+function decodeLabel(value: unknown): string {
+  return str(value).replace(/&(amp|quot|lt|gt|nbsp|#39);/g, (_, entity: string) =>
+    ({ amp: "&", quot: '"', lt: "<", gt: ">", nbsp: " ", "#39": "'" })[entity] ?? "").trim();
+}
+
 function floor(row: Row, data: Awaited<ReturnType<typeof loadThread>>, id: string): PostV1 {
   const root = data.tid === id;
-  const uid = numeric(row.authorid);
+  const uid = numeric(row.authorid) ?? (root ? numeric(data.thread.authorid) : undefined);
   const author = obj(uid ? data.users[uid] : undefined);
   const name = row.author || (root ? data.thread.author : "") || author?.username;
   const media: MediaV1[] = [];
