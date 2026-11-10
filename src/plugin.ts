@@ -12,6 +12,8 @@ const LANGUAGE = ["zh-CN"];
 const FORUM_INDEX = "/nuke.php?__lib=nga_index&__act=get_all_forums";
 const SUBBOARD_BATCH_SIZE = 4;
 const HTTP_TIMEOUT_MILLIS = 12_000;
+const THREAD_TIMEOUT_MILLIS = 8_000;
+const APP_THREAD = "/app_api.php?__lib=post&__act=list";
 const MAX_QUOTE_CARDS = 100;
 // NGA uses the same floor metadata for quoted posts and standalone "Reply to" headers.
 const REPLY_HEADER = /^\s*(?:\[b\]\s*Reply to\s+)?\[pid=(\d{1,16}),(\d{1,16}),\d+\][^\[]*\[\/pid\]\s*(?:\[b\])?Post by\s+\[uid=(\d{1,16})\]([^\[]+)\[\/uid\]\s*\(([^)]+)\):?\s*\[\/b\]/i;
@@ -52,7 +54,7 @@ defineFlareSocialPlugin({
           .map(({ name, value }) => ({ name, value }));
         const accountId = numeric(cookies.find(({ name }) => name === "ngaPassportUid")?.value);
         if (!accountId || !cookies.some(({ name, value }) => name === "ngaPassportCid" && value)) return { type: "pending" };
-        const response = await get(SESSION, cookies);
+        const response = await requestJson(SESSION, cookies);
         if (response.status !== 200 || response.root?.error || response.root?.data == null) return { type: "pending" };
         const found = await accountProfile(accountId, cookies).catch(() => undefined);
         const profile = user(accountId, found?.username ?? "", found) ?? { key: key(accountId), handle: accountId, displayName: "NGA 用户 " + accountId };
@@ -90,7 +92,7 @@ defineFlareSocialPlugin({
         })) : [];
         const parents = SUBBOARD_PARENTS.slice(offset, offset + SUBBOARD_BATCH_SIZE);
         const cookies = await cookiesFor(context);
-        const index = offset === 0 ? get(FORUM_INDEX, [], 11, 4_000).catch(() => undefined) : undefined;
+        const index = offset === 0 ? requestJson(FORUM_INDEX, [], 11, 4_000).catch(() => undefined) : undefined;
         const children = await Promise.all(parents.map(async (fid) => {
           const data = await api("/thread.php?fid=" + fid + "&page=1", context, cookies).catch(() => undefined);
           const forum = obj(data?.__F);
@@ -129,7 +131,7 @@ defineFlareSocialPlugin({
         const cookies = await cookiesFor(context);
         const uid = numeric(handle);
         if (uid) return publicProfile(await accountProfile(uid, cookies));
-        const { root } = await get("/nuke.php?__lib=ucp&__act=get&username=" + encodeURIComponent(handle), cookies, 14);
+        const { root } = await requestJson("/nuke.php?__lib=ucp&__act=get&username=" + encodeURIComponent(handle), cookies, 14);
         return publicProfile(rows(root?.result)[0]);
       },
     },
@@ -190,15 +192,20 @@ function collectPublicBoards(group: Row, seen: Set<string>): TimelineDescriptorV
   });
 }
 
-async function get(path: string, cookies: Cookie[], output = 11, timeoutMillis = HTTP_TIMEOUT_MILLIS) {
+async function requestJson(
+  path: string, cookies: Cookie[], output = 11, timeoutMillis = HTTP_TIMEOUT_MILLIS, form?: Record<string, string>,
+) {
   const response = await flare.http.request({
     url: ORIGIN + path + "&__output=" + output,
+    method: form ? "POST" : undefined,
+    body: form ? { type: "form", values: form } : undefined,
     cookies,
     timeoutMillis,
     headers: {
       Accept: "application/json",
       Referer: ORIGIN + "/",
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+      ...(form ? { "X-User-Agent": "Nga_Official" } : {}),
     },
   }).catch(() => fail("Network", "连接 NGA 失败，请重试"));
   let root: Row | undefined;
@@ -207,26 +214,35 @@ async function get(path: string, cookies: Cookie[], output = 11, timeoutMillis =
 }
 
 async function api(path: string, context: PluginInvocationContextV1, cookies?: Cookie[]): Promise<Row> {
-  let result = await get(path, cookies ?? await cookiesFor(context));
+  const data = await webData(path, context, cookies ?? await cookiesFor(context));
+  if (!data) fail("InvalidResponse", "NGA 没有返回可读取的数据");
+  return data;
+}
+
+async function webData(path: string, context: PluginInvocationContextV1, cookies: Cookie[], timeoutMillis = HTTP_TIMEOUT_MILLIS) {
+  let result = await requestJson(path, cookies, 11, timeoutMillis);
   if (context.scope === "guest" && str(list(result.root?.error)[0]).startsWith("15:")) {
     // Use the same anonymous session token NGA's browser page offers when entering as a guest.
     const script = str(list(result.root?.error)[1]);
     const guest = /document\.cookie\s*=\s*'guestJs=(\d{1,14}_[a-z0-9]{1,64});/i.exec(script)?.[1];
-    if (guest) result = await get(path + "&rand=" + Date.now(), [{ name: "guestJs", value: guest }]);
+    if (guest) result = await requestJson(path + "&rand=" + Date.now(), [{ name: "guestJs", value: guest }], 11, timeoutMillis);
   }
   const { status, root } = result;
   const data = obj(root?.data);
   const details = data?.__MESSAGE;
   const message = str(list(root?.error)[0]) || str(root?.msg) ||
     str(list(details)[1] ?? obj(details)?.["1"]);
-  if (status === 401 || status === 403 || /未登录|先登录|访客|权限/.test(message)) {
+  requireApiSuccess(status, message);
+  return data;
+}
+
+function requireApiSuccess(status: number, message: string) {
+  if (status === 401 || status === 403 || /未登录|先登录|请登录|访客|权限/.test(message)) {
     fail("AuthenticationRequired", message || "请登录 NGA 或检查版面权限");
   }
   if (status === 404 || /帖子不存在|主题不存在|找不到/.test(message)) fail("NotFound", message || "NGA 页面不存在");
   if (status === 429) fail("RateLimited", "NGA 请求过于频繁");
   if (status >= 400 || message) fail("Remote", message || "NGA 暂时无法返回数据");
-  if (!data) fail("InvalidResponse", "NGA 没有返回可读取的数据");
-  return data;
 }
 
 async function cookiesFor(context: PluginInvocationContextV1): Promise<Cookie[]> {
@@ -240,7 +256,7 @@ async function cookiesFor(context: PluginInvocationContextV1): Promise<Cookie[]>
 }
 
 async function accountProfile(uid: string, cookies: Cookie[], timeoutMillis?: number): Promise<Row | undefined> {
-  const { root } = await get("/nuke.php?__lib=ucp&__act=get&uid=" + uid, cookies, 14, timeoutMillis);
+  const { root } = await requestJson("/nuke.php?__lib=ucp&__act=get&uid=" + uid, cookies, 14, timeoutMillis);
   return rows(root?.result).find((profile) => numeric(profile.uid) === uid);
 }
 
@@ -252,7 +268,8 @@ function publicProfile(row: Row | undefined): ProfileV1 {
 
 async function loadThread(tid: string, batch: number, context: PluginInvocationContextV1, withAuthorAvatar: boolean) {
   const cookies = await cookiesFor(context);
-  const data = await api("/read.php?tid=" + tid + "&page=" + batch, context, cookies);
+  const web = await webData("/read.php?tid=" + tid + "&page=" + batch, context, cookies, THREAD_TIMEOUT_MILLIS);
+  const data = web ?? await appThreadData(tid, batch, cookies);
   const thread = obj(data.__T);
   const replies = rows(data.__R);
   if (!thread || !replies.length) fail("NotFound", "找不到这篇帖子或楼层");
@@ -268,6 +285,36 @@ async function loadThread(tid: string, batch: number, context: PluginInvocationC
     tid, batch, thread, replies, users, forum: obj(data.__F),
     attachmentHost: str(obj(data.__GLOBAL)?._ATTACH_BASE_VIEW),
     hasMore: total !== undefined ? batch * size < total : replies.length >= size,
+  };
+}
+
+async function appThreadData(tid: string, batch: number, cookies: Cookie[]): Promise<Row> {
+  // The web endpoint sometimes returns an unfinished JSON document. The app's
+  // read-only list operation returns the same numbered pages independently.
+  const { status, root } = await requestJson(APP_THREAD, cookies, 11, THREAD_TIMEOUT_MILLIS, {
+    app_id: "1010", tid, page: String(batch),
+  });
+  const code = number(root?.code);
+  requireApiSuccess(status, code === 0 ? "" : str(root?.msg));
+  if (!root || code !== 0 || number(root.currentPage) !== batch || typeof root.tsubject !== "string") {
+    fail("InvalidResponse", "NGA 网页和备用接口都没有返回完整的帖子数据");
+  }
+  const users: Row = {};
+  const replies = rows(root.result).filter((row) => numeric(row.tid) === tid).map((row) => {
+    const author = obj(row.author);
+    const uid = numeric(author?.uid ?? row.authorid);
+    if (uid && author) users[uid] = author;
+    const name = (number(row.lou) === 0 ? str(root.tauthor) : "") || str(author?.username) || str(row.author);
+    return { ...row, author: name, authorid: uid };
+  });
+  if (!replies.length) fail("InvalidResponse", "NGA 备用接口没有返回这一页的楼层");
+  const total = number(root.vrows);
+  return {
+    __T: { tid, fid: root.fid, subject: root.tsubject, authorid: root.tauthorid, author: root.tauthor,
+      replies: total === undefined ? undefined : Math.max(0, total - 1) },
+    __F: { name: root.forum_name },
+    __U: users, __R: replies, __R__ROWS_PAGE: root.perPage, __ROWS: root.vrows,
+    __GLOBAL: { _ATTACH_BASE_VIEW: str(root.attachPrefix).replace(/^https?:\/\//i, "").replace(/\/$/, "") },
   };
 }
 
@@ -327,7 +374,16 @@ function floor(row: Row, data: Awaited<ReturnType<typeof loadThread>>, id: strin
   const name = row.author || (root ? data.thread.author : "") || author?.username;
   const media: MediaV1[] = [];
   const title = root ? str(data.thread.subject || row.subject) : "";
-  const raw = str(row.content).replace(/<(script|style|iframe)\b[^>]*>[\s\S]*?<\/\1>/gi, "");
+  const raw = str(row.content)
+    .replace(/<(script|style|iframe)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+    .replace(/<a\b[^>]*>/gi, (tag) => tag.replace(/\shref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i,
+      (attribute, double: string | undefined, single: string | undefined, bare: string | undefined) => {
+        const href = decodeLabel(double ?? single ?? bare);
+        const absolute = https(href);
+        if (absolute) return ' href="' + escape(absolute) + '"';
+        // The app response contains JavaScript-only UI links that Flare rejects.
+        return href.startsWith("//") || /^[a-z][\w+.-]*:/i.test(href) ? "" : attribute;
+      }));
   const { text, quotes } = separateQuotes(raw, data);
   const body = trimBreaks(text
     .replace(/\[img(?:=[^\]]*)?\]([^\[]+)\[\/img\]/gi, (_, source: string) => {

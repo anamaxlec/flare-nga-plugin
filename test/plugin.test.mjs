@@ -20,8 +20,9 @@ function register(respond, { supportsMatchAll = true } = {}) {
       http: {
         request: async (request) => {
           const url = new URL(request.url);
-          requests.push({ url, cookies: request.cookies, timeoutMillis: request.timeoutMillis });
-          return { status: 200, headers: {}, body: JSON.stringify(respond(url)) };
+          requests.push({ ...request, url });
+          const data = respond(url, request);
+          return { status: 200, headers: {}, body: typeof data === "string" ? data : JSON.stringify(data) };
         },
       },
     },
@@ -122,7 +123,51 @@ test("a rejected Host HTTP request returns a recoverable network error", async (
   const { post, requests } = register(() => { throw new Error("Host transport reset"); });
   const key = { id: "2", host: "bbs.nga.cn" };
   await assert.rejects(post.context({ key, page }, guest), { code: "Network", message: "连接 NGA 失败，请重试" });
-  assert.equal(requests[0].timeoutMillis, 12_000);
+  assert.equal(requests[0].timeoutMillis, 8_000);
+});
+
+test("truncated web JSON falls back to the matching page of NGA's app thread API", async () => {
+  const { post, requests } = register((url, request) => {
+    if (url.pathname === "/read.php") return '{"data":{"__R":[{"content":"unfinished';
+    assert.equal(url.pathname, "/app_api.php");
+    assert.equal(url.searchParams.get("__act"), "list");
+    assert.equal(request.method, "POST");
+    assert.equal(request.body.type, "form");
+    assert.equal(request.body.values.tid, "47850087");
+    const currentPage = Number(request.body.values.page);
+    const author = { uid: 66529948, username: "UID:66529948", avatar: "a_arcane.webp" };
+    return { code: 0, msg: "操作成功", currentPage, perPage: 2, vrows: 3, fid: 510343,
+      forum_name: "赛车俱乐部", tsubject: "赛车帖子", tauthor: "mczhao2025", tauthorid: author.uid,
+      attachPrefix: "https://img.nga.cn/attachments/",
+      result: currentPage === 1 ? [
+        { tid: 47850087, pid: 0, lou: 0, author, content: '<a href="javascript:;">正文</a>[img]./race.jpg[/img]' },
+        { tid: 47850087, pid: 10, lou: 1, author, content: "第一条回复" },
+      ] : [{ tid: 47850087, pid: 11, lou: 2, author, content: "第二条回复" }],
+    };
+  });
+  const key = { id: "47850087", host: "bbs.nga.cn" };
+  const detail = await post.detail({ key }, account);
+  assert.match(detail.post.content.value, /赛车帖子.*正文/);
+  assert.doesNotMatch(detail.post.content.value, /javascript:/);
+  assert.equal(detail.post.media[0].url, "https://img.nga.cn/attachments/race.jpg");
+  assert.equal(detail.post.author.displayName, "mczhao2025");
+  assert.equal(detail.post.repliesCount, 2);
+  assert.equal(detail.post.sourceChannel.name, "赛车俱乐部");
+  const first = await post.context({ key, page }, account);
+  assert.equal(first.items.length, 2);
+  assert.equal(first.olderCursor, "2:0");
+  const next = await post.context({ key, page: { ...page, direction: "older", cursor: first.olderCursor } }, account);
+  assert.equal(next.items[0].post.content.value, "第二条回复");
+  assert.equal(next.endReached, true);
+  assert.equal(requests.length, 6);
+  assert.ok(requests.every(({ cookies }) => cookies[0]?.name === "ngaPassportUid"));
+});
+
+test("a permission error is surfaced without using the backup thread API", async () => {
+  const { post, requests } = register(() => ({ error: ["2048:请登录后访问"] }));
+  const key = { id: "47850087", host: "bbs.nga.cn" };
+  await assert.rejects(post.detail({ key }, guest), { code: "AuthenticationRequired" });
+  assert.equal(requests.length, 1);
 });
 
 test("catalog includes official boards and their independent subforums while skipping topic shortcuts", async () => {

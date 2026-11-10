@@ -3,7 +3,7 @@
   "schemaVersion": 1,
   "apiVersion": 1,
   "id": "dev.maxlec.nga",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "defaultLocale": "zh-Hans",
   "name": "NGA",
   "description": "NGA 玩家社区版面、帖子和回复",
