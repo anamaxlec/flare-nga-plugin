@@ -11,8 +11,10 @@ const CAPS = {
 const LANGUAGE = ["zh-CN"];
 const FORUM_INDEX = "/nuke.php?__lib=nga_index&__act=get_all_forums";
 const SUBBOARD_BATCH_SIZE = 4;
+const HTTP_TIMEOUT_MILLIS = 12_000;
+const MAX_QUOTE_CARDS = 100;
 // NGA uses the same floor metadata for quoted posts and standalone "Reply to" headers.
-const REPLY_HEADER = /^\s*(?:\[b\]\s*Reply to\s+)?\[pid=(\d+),(\d+),\d+\][^\[]*\[\/pid\]\s*(?:\[b\])?Post by\s+\[uid=(\d+)\]([^\[]+)\[\/uid\]\s*\(([^)]+)\):?\s*\[\/b\]/i;
+const REPLY_HEADER = /^\s*(?:\[b\]\s*Reply to\s+)?\[pid=(\d{1,16}),(\d{1,16}),\d+\][^\[]*\[\/pid\]\s*(?:\[b\])?Post by\s+\[uid=(\d{1,16})\]([^\[]+)\[\/uid\]\s*\(([^)]+)\):?\s*\[\/b\]/i;
 const BOARDS = [
   { name: "游戏讨论", forums: [
     ["7", "艾泽拉斯议事厅"], ["310", "精英议会"], ["510569", "魔兽世界：无限"],
@@ -188,7 +190,7 @@ function collectPublicBoards(group: Row, seen: Set<string>): TimelineDescriptorV
   });
 }
 
-async function get(path: string, cookies: Cookie[], output = 11, timeoutMillis?: number) {
+async function get(path: string, cookies: Cookie[], output = 11, timeoutMillis = HTTP_TIMEOUT_MILLIS) {
   const response = await flare.http.request({
     url: ORIGIN + path + "&__output=" + output,
     cookies,
@@ -198,7 +200,7 @@ async function get(path: string, cookies: Cookie[], output = 11, timeoutMillis?:
       Referer: ORIGIN + "/",
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
     },
-  });
+  }).catch(() => fail("Network", "连接 NGA 失败，请重试"));
   let root: Row | undefined;
   try { root = obj(JSON.parse(response.body)); } catch { /* Check the status below. */ }
   return { status: response.status, root };
@@ -372,8 +374,10 @@ function separateQuotes(content: string, data: Awaited<ReturnType<typeof loadThr
   let depth = 0;
   let start = 0;
   let inner = 0;
-  for (const tag of content.slice(bodyStart).matchAll(/\[(\/?)quote(?:=[^\]]*)?\]/gi)) {
-    const index = tag.index + bodyStart;
+  const tags = /\[(\/?)quote(?:=[^\]]*)?\]/gi;
+  tags.lastIndex = bodyStart;
+  for (let tag = tags.exec(content); tag; tag = tags.exec(content)) {
+    const index = tag.index;
     const end = index + tag[0].length;
     if (!tag[1]) {
       if (depth++ === 0) { start = index; inner = end; }
@@ -381,7 +385,7 @@ function separateQuotes(content: string, data: Awaited<ReturnType<typeof loadThr
       text += content.slice(offset, start);
       const excerpt = content.slice(inner, index);
       const header = REPLY_HEADER.exec(excerpt);
-      if (header) quotes.push(quotedFloor(header, excerpt.slice(header[0].length), data));
+      if (header && quotes.length < MAX_QUOTE_CARDS) quotes.push(quotedFloor(header, excerpt.slice(header[0].length), data));
       else unlinked.push(content.slice(start, end));
       offset = end;
     }
@@ -406,7 +410,7 @@ function quotedFloor(header: RegExpExecArray, excerpt: string, data: Awaited<Ret
   return {
     // Flare caches quote cards by key. Keep the preview separate from the full floor.
     key: key("quote-" + tid + "-" + pid),
-    author: user(numeric(uid), decodeLabel(name), obj(data.users[uid])), createdAt: time(timestamp),
+    author: user(numeric(uid), decodeLabel(name).slice(0, 1_024), obj(data.users[uid])), createdAt: time(timestamp),
     content: { format: "plain", value: preview || "查看原楼层" },
     url: floorUrl(tid, pid), detailType: "link", sourceLanguages: LANGUAGE,
   };

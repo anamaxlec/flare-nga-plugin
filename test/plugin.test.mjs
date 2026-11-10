@@ -8,10 +8,11 @@ const page = { direction: "refresh", limit: 20 };
 const guest = { scope: "guest", credentialAvailable: false };
 const account = { scope: "account", credentialAvailable: true };
 
-function register(respond) {
+function register(respond, { supportsMatchAll = true } = {}) {
   let plugin;
   const requests = [];
-  vm.runInNewContext(source, {
+  const prelude = supportsMatchAll ? "" : "String.prototype.matchAll = undefined;\n";
+  vm.runInNewContext(prelude + source, {
     defineFlareSocialPlugin(value) { plugin = value; },
     flare: {
       error: ({ code, message }) => Object.assign(new Error(message.value), { code }),
@@ -19,7 +20,7 @@ function register(respond) {
       http: {
         request: async (request) => {
           const url = new URL(request.url);
-          requests.push({ url, cookies: request.cookies });
+          requests.push({ url, cookies: request.cookies, timeoutMillis: request.timeoutMillis });
           return { status: 200, headers: {}, body: JSON.stringify(respond(url)) };
         },
       },
@@ -81,7 +82,7 @@ test("thread detail loads a missing signed-in author's avatar and renders the or
   assert.equal(thread.items[1].post.author.avatarUrl, "https://img4.nga.cn/ngabbs/face/a_arcane.webp");
 });
 
-test("reply text stays ahead of a compact native quote that opens the original floor", async () => {
+test("reply text stays ahead of a compact quote on runtimes without matchAll", async () => {
   const quote = "[pid=10,2,1]Reply[/pid] [b]Post by [uid=42]B[/uid] (2026-11-10 00:32):[/b]";
   const root = { lou: 0, pid: 0, authorid: 40749600, content: "Original body" };
   const original = { lou: 1, pid: 10, authorid: 42, content: "原楼层正文" };
@@ -95,7 +96,7 @@ test("reply text stays ahead of a compact native quote that opens the original f
     __R: [root, original, reply, direct],
     __U: { 42: { username: "B", avatar: "a_sheep.png" }, 43: { username: "C" } },
     __GLOBAL: { _ATTACH_BASE_VIEW: "img.nga.cn/attachments" },
-  } }));
+  } }), { supportsMatchAll: false });
   const result = await post.context({ key: { id: "2", host: "bbs.nga.cn" }, page }, guest);
   const [, , replyItem, directItem] = result.items;
   assert.equal(replyItem.post.content.value, "这层自己的<del>文字</del>（哭笑）");
@@ -115,6 +116,13 @@ test("reply text stays ahead of a compact native quote that opens the original f
   assert.equal(requests.length, 1);
   const opened = await post.context({ key: { id: "p2-10-1", host: "bbs.nga.cn" }, page }, guest);
   assert.equal(opened.items[0].post.content.value, original.content);
+});
+
+test("a rejected Host HTTP request returns a recoverable network error", async () => {
+  const { post, requests } = register(() => { throw new Error("Host transport reset"); });
+  const key = { id: "2", host: "bbs.nga.cn" };
+  await assert.rejects(post.context({ key, page }, guest), { code: "Network", message: "连接 NGA 失败，请重试" });
+  assert.equal(requests[0].timeoutMillis, 12_000);
 });
 
 test("catalog includes official boards and their independent subforums while skipping topic shortcuts", async () => {

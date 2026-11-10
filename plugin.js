@@ -14,7 +14,9 @@
   var LANGUAGE = ["zh-CN"];
   var FORUM_INDEX = "/nuke.php?__lib=nga_index&__act=get_all_forums";
   var SUBBOARD_BATCH_SIZE = 4;
-  var REPLY_HEADER = /^\s*(?:\[b\]\s*Reply to\s+)?\[pid=(\d+),(\d+),\d+\][^\[]*\[\/pid\]\s*(?:\[b\])?Post by\s+\[uid=(\d+)\]([^\[]+)\[\/uid\]\s*\(([^)]+)\):?\s*\[\/b\]/i;
+  var HTTP_TIMEOUT_MILLIS = 12e3;
+  var MAX_QUOTE_CARDS = 100;
+  var REPLY_HEADER = /^\s*(?:\[b\]\s*Reply to\s+)?\[pid=(\d{1,16}),(\d{1,16}),\d+\][^\[]*\[\/pid\]\s*(?:\[b\])?Post by\s+\[uid=(\d{1,16})\]([^\[]+)\[\/uid\]\s*\(([^)]+)\):?\s*\[\/b\]/i;
   var BOARDS = [
     { name: "\u6E38\u620F\u8BA8\u8BBA", forums: [
       ["7", "\u827E\u6CFD\u62C9\u65AF\u8BAE\u4E8B\u5385"],
@@ -201,7 +203,7 @@
       return [board(fid, name)];
     });
   }
-  async function get(path, cookies, output = 11, timeoutMillis) {
+  async function get(path, cookies, output = 11, timeoutMillis = HTTP_TIMEOUT_MILLIS) {
     const response = await flare.http.request({
       url: ORIGIN + path + "&__output=" + output,
       cookies,
@@ -211,7 +213,7 @@
         Referer: ORIGIN + "/",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36"
       }
-    });
+    }).catch(() => fail("Network", "\u8FDE\u63A5 NGA \u5931\u8D25\uFF0C\u8BF7\u91CD\u8BD5"));
     let root;
     try {
       root = obj(JSON.parse(response.body));
@@ -370,8 +372,10 @@
     let depth = 0;
     let start = 0;
     let inner = 0;
-    for (const tag of content.slice(bodyStart).matchAll(/\[(\/?)quote(?:=[^\]]*)?\]/gi)) {
-      const index = tag.index + bodyStart;
+    const tags = /\[(\/?)quote(?:=[^\]]*)?\]/gi;
+    tags.lastIndex = bodyStart;
+    for (let tag = tags.exec(content); tag; tag = tags.exec(content)) {
+      const index = tag.index;
       const end = index + tag[0].length;
       if (!tag[1]) {
         if (depth++ === 0) {
@@ -382,7 +386,7 @@
         text += content.slice(offset, start);
         const excerpt = content.slice(inner, index);
         const header = REPLY_HEADER.exec(excerpt);
-        if (header) quotes.push(quotedFloor(header, excerpt.slice(header[0].length), data));
+        if (header && quotes.length < MAX_QUOTE_CARDS) quotes.push(quotedFloor(header, excerpt.slice(header[0].length), data));
         else unlinked.push(content.slice(start, end));
         offset = end;
       }
@@ -400,7 +404,7 @@
     return {
       // Flare caches quote cards by key. Keep the preview separate from the full floor.
       key: key("quote-" + tid + "-" + pid),
-      author: user(numeric(uid), decodeLabel(name), obj(data.users[uid])),
+      author: user(numeric(uid), decodeLabel(name).slice(0, 1024), obj(data.users[uid])),
       createdAt: time(timestamp),
       content: { format: "plain", value: preview || "\u67E5\u770B\u539F\u697C\u5C42" },
       url: floorUrl(tid, pid),
